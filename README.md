@@ -14,6 +14,13 @@ A rather useful, vibe coded, distro-hopping migration tool.
 If it doesn't work, blame Claude.
 
 ---
+## Disclaimer
+
+> This script is provided as-is, **unsupported and unmaintained**. No warranty is given. No support is offered. You run this entirely at your own risk. The author accepts zero responsibility for data loss, system damage, corrupted configs, existential dread, or any other outcome resulting from use of this script.
+>
+> This is a hobby tool. Test it. Read what it does before you run it. Back up your data independently before doing anything irreversible.
+
+---
 
 ## What it does
 
@@ -112,14 +119,6 @@ Where distro-plopper adds value:
 - **Ordering and automation** — a home folder backup is just files. distro-plopper installs packages first, then drops configs, then handles TurboPrint, CUPS, and DisplayCAL in the right sequence with checks along the way. Doing that manually from a backup is tedious and error-prone.
 
 The honest limitation — if you already keep a good home folder backup (Timeshift, rsync, Restic, Borg), distro-plopper's config capture is largely redundant. Its real value is the package list + reinstall automation + system files + ordering logic. Think of it less as a backup tool and more as a migration assistant — it knows what order to do things in on a fresh distro, which a raw file restore doesn't.
-
----
-
-## Disclaimer
-
-> This script is provided as-is, **unsupported and unmaintained**. No warranty is given. No support is offered. You run this entirely at your own risk. The author accepts zero responsibility for data loss, system damage, corrupted configs, existential dread, or any other outcome resulting from use of this script.
->
-> This is a hobby tool. Test it. Read what it does before you run it. Back up your data independently before doing anything irreversible.
 
 ---
 

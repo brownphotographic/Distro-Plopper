@@ -53,6 +53,7 @@
 #   --skip-flatpak-data   Skip ~/.var/app data
 #   --skip-steam          Skip all Steam data
 #   --skip-homedirs       Skip XDG home directories (Documents, Downloads, etc.)
+#   --skip-userhomes      Skip /home/* user directory export
 #   --no-archive          Skip .tar.gz creation (bundle directory only)
 #   --output DIR          Output directory (default: ~/distro-plopper-TIMESTAMP)
 #
@@ -71,6 +72,7 @@
 #   --no-displaycal       Skip DisplayCAL/ArgyllCMS profile restore
 #   --no-turboprint       Skip TurboPrint config restore
 #   --no-homedirs         Skip XDG home directory restore
+#   --no-userhomes        Skip /home/* user directory restore
 #   --dry-run             Show what would be done, do nothing
 #
 # EXAMPLES:
@@ -229,6 +231,7 @@ SKIP_BROWSERS=false
 SKIP_FLATPAK_DATA=false
 SKIP_STEAM=false
 SKIP_HOMEDIRS=false
+SKIP_USERHOMES=false
 # Initialised here so they are always bound regardless of TUI/non-TUI path
 ARCHIVE=""
 ARCHIVE_CHOICE="yes"
@@ -251,6 +254,7 @@ EXP_TURBOPRINT=true
 EXP_CUPS=true
 EXP_DISPLAYCAL=true
 EXP_HOMEDIRS=false
+EXP_USERHOMES=false
 
 # Import flags
 BUNDLE_PATH=""
@@ -267,6 +271,7 @@ IMP_NO_CUPS=false
 IMP_NO_DISPLAYCAL=false
 IMP_NO_TURBOPRINT=false
 IMP_NO_HOMEDIRS=false
+IMP_NO_USERHOMES=false
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -279,6 +284,7 @@ while [[ $# -gt 0 ]]; do
         --skip-flatpak-data) SKIP_FLATPAK_DATA=true ;;
         --skip-steam)        SKIP_STEAM=true ;;
         --skip-homedirs)     SKIP_HOMEDIRS=true ;;
+        --skip-userhomes)    SKIP_USERHOMES=true ;;
         --no-archive)        ARCHIVE_CHOICE="no" ;;
         --output)            OUTPUT_DIR="$2"; IMPORT_OUTPUT_DIR="$2"; shift ;;
         # import options
@@ -295,6 +301,7 @@ while [[ $# -gt 0 ]]; do
         --no-displaycal)     IMP_NO_DISPLAYCAL=true ;;
         --no-turboprint)     IMP_NO_TURBOPRINT=true ;;
         --no-homedirs)       IMP_NO_HOMEDIRS=true ;;
+        --no-userhomes)      IMP_NO_USERHOMES=true ;;
         --help|-h)
             grep "^# " "$0" | sed 's/^# \{0,2\}//' | head -60
             exit 0 ;;
@@ -755,6 +762,23 @@ SCAN_RESULTS[home_dirs_total]=$(numfmt --to=iec "$HOME_DIRS_BYTES" 2>/dev/null |
 [[ "${SCAN_RESULTS[home_dirs_count]}" -eq 0 ]] && ok "XDG home dirs: none found"
 [[ "$SKIP_HOMEDIRS" == true ]] && warn "Home directory copy SKIPPED (--skip-homedirs)"
 
+# S23. /home/* user directories
+info "Scanning /home/ user directories..."
+> "$SCAN_TMP/user-homes.txt"
+for d in /home/*/; do
+    [[ ! -d "$d" ]] && continue
+    NAME=$(basename "$d")
+    SIZE=$(du -sh "$d" 2>/dev/null | awk '{print $1}' | tr -d '[:space:]' || echo "?")
+    BYTES=$(du -sb "$d" 2>/dev/null | awk '{print $1}' | tr -d '[:space:]' || echo 0)
+    BYTES=${BYTES:-0}
+    LABEL="$NAME ($SIZE)"
+    [[ "$d" == "$HOME/" || "$d" == "${HOME}/" ]] && LABEL="$NAME ($SIZE) ← current user"
+    echo "$NAME|$d|$SIZE|$BYTES" >> "$SCAN_TMP/user-homes.txt"
+    ok "/home/$NAME: $SIZE"
+done
+SCAN_RESULTS[user_homes_count]=$(wc -l < "$SCAN_TMP/user-homes.txt")
+[[ "${SCAN_RESULTS[user_homes_count]}" -eq 0 ]] && ok "/home/: no user directories found"
+
 # =============================================================================
 # PHASE 1 COMPLETE — Write SCAN_SUMMARY.md + print to terminal
 # =============================================================================
@@ -1051,8 +1075,25 @@ cat >> "$SM" << SMEOF4
 
 ---
 
-## Warnings
+## /home User Directories
+
+| User | Path | Size |
+|------|------|------|
 SMEOF4
+
+while IFS="|" read -r name dir size _bytes; do
+    MARKER=""
+    [[ "$dir" == "$HOME/" || "$dir" == "${HOME}" ]] && MARKER=" ← current user"
+    echo "| $name$MARKER | \`$dir\` | $size |" >> "$SM"
+done < "$SCAN_TMP/user-homes.txt"
+[[ ! -s "$SCAN_TMP/user-homes.txt" ]] && echo "_No /home directories found._" >> "$SM"
+
+cat >> "$SM" << SMEOF5
+
+---
+
+## Warnings
+SMEOF5
 
 if [[ ${#WARNINGS[@]} -gt 0 ]]; then
     for w in "${WARNINGS[@]}"; do echo "- ⚠️  $w" >> "$SM"; done
@@ -1095,6 +1136,7 @@ printf "  %-30s %s\n" "SSH private keys:" "${SCAN_RESULTS[ssh_key_count]:-0}  (N
 printf "  %-30s %s\n" "NFS exports:"      "${SCAN_RESULTS[nfs_exports]:-false}"
 printf "  %-30s %s\n" "NFS fstab mounts:" "${SCAN_RESULTS[nfs_mounts]:-false}"
 printf "  %-30s %s\n" "XDG home dirs:"    "${SCAN_RESULTS[home_dirs_count]:-0} dirs  (${SCAN_RESULTS[home_dirs_total]:-0} total)"
+printf "  %-30s %s\n" "/home/ users:"     "${SCAN_RESULTS[user_homes_count]:-0} found"
 echo ""
 if [[ ${#WARNINGS[@]} -gt 0 ]]; then
     printf "  ${YELLOW}%-30s${RESET}\n" "WARNINGS"
@@ -1215,7 +1257,10 @@ FLAT_LABEL="Flatpak app data — ~/.var/app (${SCAN_RESULTS[flatpak_data_size]:-
 # Browsers — show each one found
 if [[ -s "$SCAN_TMP/browser-profiles.txt" ]]; then
     BROWSER_LIST=$(cut -d'|' -f1 "$SCAN_TMP/browser-profiles.txt" | tr '\n' ', ' | sed 's/,$//')
-    EXP_OPTS+=("browsers" "Browser profiles — $BROWSER_LIST (~$(du -sh $(awk -F'|' '{print $2}' "$SCAN_TMP/browser-profiles.txt" | tr '\n' ' ') 2>/dev/null | awk '{sum+=$1} END{print sum}' || echo '?')MB total)" "ON")
+    BROWSER_TOTAL_BYTES=$(awk -F'|' '{print $2}' "$SCAN_TMP/browser-profiles.txt" \
+        | xargs -I{} du -sb {} 2>/dev/null | awk '{sum+=$1} END{print sum+0}')
+    BROWSER_TOTAL=$(numfmt --to=iec "$BROWSER_TOTAL_BYTES" 2>/dev/null || echo "?")
+    EXP_OPTS+=("browsers" "Browser profiles — $BROWSER_LIST (~$BROWSER_TOTAL total)" "ON")
 else
     EXP_OPTS+=("browsers" "Browser profiles — none found" "OFF")
 fi
@@ -1312,6 +1357,35 @@ Space = toggle  |  Tab = move to OK/Cancel  |  Enter = confirm  |  Esc = skip al
     [[ -s "$SCAN_TMP/home-dirs-selected.txt" ]] && EXP_HOMEDIRS=true
 fi
 
+# ── /home user directories sub-selection ─────────────────────────────────────
+> "$SCAN_TMP/user-homes-selected.txt"
+EXP_USERHOMES=false
+if [[ -s "$SCAN_TMP/user-homes.txt" ]]; then
+    USERHOME_OPTS=()
+    while IFS="|" read -r name dir size _bytes; do
+        LABEL="$name  ($size)"
+        [[ "$dir" == "$HOME/" || "$dir" == "${HOME}" ]] && LABEL="$name  ($size)  ← current user (already covered by other sections)"
+        USERHOME_OPTS+=("$name" "$LABEL" "OFF")
+    done < "$SCAN_TMP/user-homes.txt"
+
+    USERHOME_CHOICES=$(whiptail --title "Export — /home User Directories" \
+      --checklist \
+"Select which /home directories to include.
+All are OFF by default — these can be very large.
+Current user data is already captured by other sections.
+
+Space = toggle  |  Tab = move to OK/Cancel  |  Enter = confirm  |  Esc = skip all" \
+      $BOX_H $BOX_W $(( BOX_H - 10 )) \
+      "${USERHOME_OPTS[@]}" \
+      3>&1 1>&2 2>&3) || USERHOME_CHOICES=""
+
+    while IFS="|" read -r name dir size _bytes; do
+        [[ "$USERHOME_CHOICES" == *"\"$name\""* ]] \
+            && echo "$name|$dir|$size|$_bytes" >> "$SCAN_TMP/user-homes-selected.txt"
+    done < "$SCAN_TMP/user-homes.txt"
+    [[ -s "$SCAN_TMP/user-homes-selected.txt" ]] && EXP_USERHOMES=true
+fi
+
 # ── Archive options ───────────────────────────────────────────────────────────
 ARCHIVE_CHOICE=$(whiptail --title "Export — Archive Options" \
   --menu \
@@ -1349,6 +1423,11 @@ if [[ "$EXP_HOMEDIRS" == true ]]; then
         SELECTED_LIST+="  ✓ Home dir: $(basename "$dir") ($size)\n"
     done < "$SCAN_TMP/home-dirs-selected.txt"
 fi
+if [[ "$EXP_USERHOMES" == true ]]; then
+    while IFS="|" read -r name dir size _bytes; do
+        SELECTED_LIST+="  ✓ /home/$name ($size)\n"
+    done < "$SCAN_TMP/user-homes-selected.txt"
+fi
 [[ "$EXP_NFS"        == true ]] && SELECTED_LIST+="  ✓ NFS configuration\n"
 [[ "$EXP_SYSTEMD"    == true ]] && SELECTED_LIST+="  ✓ Systemd services\n"
 [[ "$EXP_DOCKER"     == true ]] && SELECTED_LIST+="  ✓ Docker inventory\n"
@@ -1382,9 +1461,23 @@ EXP_DISPLAYCAL=$(  [[ "${SCAN_RESULTS[dcal_found]:-false}"  == "true" ]] && echo
 # Non-TUI: --skip-homedirs omits all; otherwise copy every dir found
 > "$SCAN_TMP/home-dirs-selected.txt"
 if [[ "$SKIP_HOMEDIRS" == false ]] && [[ -s "$SCAN_TMP/home-dirs.txt" ]]; then
+    warn "XDG home dirs will ALL be copied (${SCAN_RESULTS[home_dirs_total]:-?} total). Use --skip-homedirs to exclude."
+    while IFS="|" read -r xdg dir size _bytes; do
+        info "  Will copy: $xdg → $dir ($size)"
+    done < "$SCAN_TMP/home-dirs.txt"
     cp "$SCAN_TMP/home-dirs.txt" "$SCAN_TMP/home-dirs-selected.txt"
 fi
 EXP_HOMEDIRS=$(    [[ -s "$SCAN_TMP/home-dirs-selected.txt" ]] && echo true || echo false)
+# Non-TUI: --skip-userhomes omits all; otherwise copy every /home dir found
+> "$SCAN_TMP/user-homes-selected.txt"
+if [[ "$SKIP_USERHOMES" == false ]] && [[ -s "$SCAN_TMP/user-homes.txt" ]]; then
+    warn "/home user dirs will ALL be copied. Use --skip-userhomes to exclude."
+    while IFS="|" read -r name dir size _bytes; do
+        info "  Will copy: /home/$name ($size)"
+    done < "$SCAN_TMP/user-homes.txt"
+    cp "$SCAN_TMP/user-homes.txt" "$SCAN_TMP/user-homes-selected.txt"
+fi
+EXP_USERHOMES=$(   [[ -s "$SCAN_TMP/user-homes-selected.txt" ]] && echo true || echo false)
 # Only default to "yes" if --no-archive wasn't passed on the CLI
 [[ "$ARCHIVE_CHOICE" != "no" ]] && ARCHIVE_CHOICE="yes"
 
@@ -1429,7 +1522,7 @@ copy_with_spinner() {
 # PHASE 2: CREATE OUTPUT STRUCTURE
 # =============================================================================
 header "PHASE 2: Creating output structure..."
-mkdir -p "$OUTPUT_DIR"/{packages,configs/{dotfiles,config-dirs,local-share},flatpak,browsers,gnome/extensions-backup,nfs,ssh,fonts,systemd,docker,hardware,steam,homedirs,scripts}
+mkdir -p "$OUTPUT_DIR"/{packages,configs/{dotfiles,config-dirs,local-share},flatpak,browsers,gnome/extensions-backup,nfs,ssh,fonts,systemd,docker,hardware,steam,homedirs,user-homes,scripts}
 
 MD="$OUTPUT_DIR/MIGRATION_REPORT.md"
 
@@ -1714,6 +1807,25 @@ echo "homedirs_present=true" >> "$MANIFEST"
 ok "XDG home directories copied"
 fi # EXP_HOMEDIRS
 
+# ── /home user directories ────────────────────────────────────────────────────
+if [[ "$EXP_USERHOMES" == true ]]; then
+section_md "10c. /home User Directories"
+note_md "⚠️  Restore requires sudo. Copied with no-overwrite."
+log_md "| User | Path | Size |"; log_md "|------|------|------|"
+while IFS="|" read -r name dir size _bytes; do
+    DIR_BYTES=$(echo "${_bytes:-0}" | tr -d '[:space:]'); DIR_BYTES=${DIR_BYTES:-0}
+    if [[ "$DIR_BYTES" -gt 104857600 ]]; then
+        copy_with_spinner "user-homes/$name ($size)" "$dir" "$OUTPUT_DIR/user-homes/"
+    else
+        cp -r "$dir" "$OUTPUT_DIR/user-homes/" 2>/dev/null || true
+    fi
+    log_md "| $name | \`$dir\` | $size |"
+    echo "userhome:$name:$dir:user-homes/$name" >> "$MANIFEST"
+done < "$SCAN_TMP/user-homes-selected.txt"
+echo "user_homes_present=true" >> "$MANIFEST"
+ok "/home user directories copied"
+fi # EXP_USERHOMES
+
 # ── System configs ────────────────────────────────────────────────────────────
 section_md "11. System Configuration" # always included
 for f in /etc/default/grub /etc/environment /etc/hosts /etc/locale.conf; do
@@ -1971,6 +2083,9 @@ cat >> "$MD" << 'CHECKLIST'
 ### Home Directories
 - [ ] Run import or manually: `cp -rn homedirs/. ~/`
 
+### /home User Directories
+- [ ] Run import or manually: `sudo cp -rn user-homes/<name>/. /home/<name>/`
+
 ### TurboPrint
 - [ ] Install TurboPrint on new system first
 - [ ] `sudo cp -r turboprint/config/. /etc/turboprint/`
@@ -2089,7 +2204,7 @@ if [[ "$BUNDLE_PATH" == *.tar.gz ]]; then
     [[ ! -f "$BUNDLE_PATH" ]] && { err "Archive not found: $BUNDLE_PATH"; exit 1; }
     info "Extracting archive: $BUNDLE_PATH"
     EXTRACT_DIR=$(mktemp -d)
-    trap 'rm -rf "$EXTRACT_DIR"' EXIT
+    trap '_pause_if_fm; rm -rf "$EXTRACT_DIR"' EXIT
     if command -v pv &>/dev/null; then
         ARCHIVE_BYTES=$(du -sb "$BUNDLE_PATH" | awk '{print $1}')
         pv --size "$ARCHIVE_BYTES" --progress --timer --eta --name "  Extracting" "$BUNDLE_PATH" \
@@ -2172,7 +2287,8 @@ HAS_GNOME=$(   [[ -f "$BUNDLE/gnome/dconf-full.ini" ]] && echo true || echo fals
 HAS_SSH=$(     [[ -f "$BUNDLE/ssh/config"          ]] && echo true || echo false)
 HAS_FONTS=$(   [[ -d "$BUNDLE/fonts"               ]] && echo true || echo false)
 HAS_STEAM=$(    [[ -d "$BUNDLE/steam"               ]] && echo true || echo false)
-HAS_HOMEDIRS=$( [[ -d "$BUNDLE/homedirs"           ]] && echo true || echo false)
+HAS_HOMEDIRS=$(   [[ -d "$BUNDLE/homedirs"           ]] && echo true || echo false)
+HAS_USERHOMES=$(  [[ -d "$BUNDLE/user-homes"        ]] && echo true || echo false)
 NFS_EXP=$(get_manifest "nfs_exports" "false")
 NFS_MNT=$(get_manifest "nfs_mounts"  "false")
 
@@ -2289,7 +2405,9 @@ PREFLIGHT_MSG+="□  Copy SSH private keys manually\n"
 PREFLIGHT_MSG+="□  Re-authenticate Tailscale: tailscale up\n"
 PREFLIGHT_MSG+="□  Re-pair Syncthing devices\n"
 PREFLIGHT_MSG+="□  Enable GNOME extensions via Extensions app\n"
-PREFLIGHT_MSG+="□  Reboot when done\n"
+PREFLIGHT_MSG+="□  Reboot (required — services won't pick up until restart)\n"
+[[ "$HAS_USERHOMES" == true ]] && \
+    PREFLIGHT_MSG+="\n⚠  /home user directory restore requires sudo\n"
 
 whiptail --title "Pre-flight Checklist" \
   --msgbox "$PREFLIGHT_MSG" \
@@ -2318,8 +2436,10 @@ before their configs are restored:
     2g. SSH config & known_hosts
     2h. Fonts
     2i. Steam config & userdata
-    2j. CUPS printers
-    2k. DisplayCAL / ArgyllCMS profiles
+    2j. XDG home dirs (Documents, Downloads etc.)
+    2k. /home user directories  (sudo)
+    2l. CUPS printers
+    2m. DisplayCAL / ArgyllCMS profiles
 
   Stage 3 — System
     3a. NFS  (shown for manual action)
@@ -2638,7 +2758,8 @@ CONFIG_OPTS=()
 [[ "$HAS_SSH"      == true ]] && CONFIG_OPTS+=("ssh"       "SSH config & known_hosts (keys NOT copied)" "ON")
 [[ "$HAS_FONTS"    == true ]] && CONFIG_OPTS+=("fonts"     "User fonts ($(du -sh "$BUNDLE/fonts" 2>/dev/null | awk '{print $1}'))" "ON")
 [[ "$HAS_STEAM"    == true ]] && CONFIG_OPTS+=("steam"     "Steam config & userdata (no game files)" "ON")
-[[ "$HAS_HOMEDIRS" == true ]] && CONFIG_OPTS+=("homedirs"  "XDG home dirs — Documents, Downloads, Pictures etc. ($(du -sh "$BUNDLE/homedirs" 2>/dev/null | awk '{print $1}'))" "ON")
+[[ "$HAS_HOMEDIRS"   == true ]] && CONFIG_OPTS+=("homedirs"   "XDG home dirs — Documents, Downloads, Pictures etc. ($(du -sh "$BUNDLE/homedirs" 2>/dev/null | awk '{print $1}'))" "ON")
+[[ "$HAS_USERHOMES"  == true ]] && CONFIG_OPTS+=("userhomes"  "/home user directories ($(du -sh "$BUNDLE/user-homes" 2>/dev/null | awk '{print $1}')) — requires sudo" "ON")
 
 RESTORE_CHOICES=""
 if [[ "${#CONFIG_OPTS[@]}" -gt 0 ]]; then
@@ -2667,6 +2788,7 @@ RESTORE_SSH=false;        [[ "$RESTORE_CHOICES" == *'"ssh"'*         ]] && RESTO
 RESTORE_FONTS=false;      [[ "$RESTORE_CHOICES" == *'"fonts"'*       ]] && RESTORE_FONTS=true
 RESTORE_STEAM=false;      [[ "$RESTORE_CHOICES" == *'"steam"'*       ]] && RESTORE_STEAM=true
 RESTORE_HOMEDIRS=false;   [[ "$RESTORE_CHOICES" == *'"homedirs"'*    ]] && RESTORE_HOMEDIRS=true
+RESTORE_USERHOMES=false;  [[ "$RESTORE_CHOICES" == *'"userhomes"'*   ]] && RESTORE_USERHOMES=true
 
 # ── Run restores ──────────────────────────────────────────────────────────────
 echo ""
@@ -2739,6 +2861,19 @@ if [[ "$RESTORE_HOMEDIRS" == true ]]; then
         BUNDLE_SRC="$BUNDLE/$bundle_subdir"
         DEST_PARENT=$(dirname "$orig_dir")
         [[ -d "$BUNDLE_SRC" ]] && do_copy "$BUNDLE_SRC" "$DEST_PARENT" && ok "homedirs: $xdg (→ $orig_dir)" && log_import "RESTORED: homedir $xdg"
+    done
+fi
+
+if [[ "$RESTORE_USERHOMES" == true ]]; then
+    step "/home user directories..."
+    grep "^userhome:" "$MANIFEST" 2>/dev/null | while IFS=: read -r _ name orig_dir bundle_subdir; do
+        BUNDLE_SRC="$BUNDLE/$bundle_subdir"
+        if [[ -d "$BUNDLE_SRC" ]]; then
+            [[ "$DRY_RUN" == true ]] && { info "[DRY RUN] would sudo cp -rn $BUNDLE_SRC/. $orig_dir"; continue; }
+            sudo mkdir -p "$orig_dir"
+            sudo cp -rn "$BUNDLE_SRC/." "$orig_dir/" 2>/dev/null || warn "Some files may not have copied for $name"
+            ok "/home/$name restored"; log_import "RESTORED: /home/$name"
+        fi
     done
 fi
 
@@ -2860,11 +2995,12 @@ Everything selected has been restored.
 Remaining manual steps:
   • Copy SSH private keys: ~/.ssh/id_*
     then run: chmod 600 ~/.ssh/id_*
-  • Reboot the system
   • tailscale up  (re-authenticate)
   • Re-pair Syncthing devices
   • Verify GPU drivers are loaded
   • Enable GNOME extensions via the Extensions app
+    (Settings → Extensions — they are installed but off by default)
+  • Reboot  ← do this last; required for services to start correctly
 
 Import log saved to:
   $IMPORT_LOG
@@ -3033,6 +3169,19 @@ if [[ "$IMP_NO_HOMEDIRS" == false && "$HAS_HOMEDIRS" == true ]]; then
     done
 fi
 
+if [[ "$IMP_NO_USERHOMES" == false && "$HAS_USERHOMES" == true ]]; then
+    step "/home user directories..."
+    grep "^userhome:" "$MANIFEST" 2>/dev/null | while IFS=: read -r _ name orig_dir bundle_subdir; do
+        BUNDLE_SRC="$BUNDLE/$bundle_subdir"
+        if [[ -d "$BUNDLE_SRC" ]]; then
+            [[ "$DRY_RUN" == true ]] && { info "[DRY RUN] would sudo cp -rn $BUNDLE_SRC/. $orig_dir"; continue; }
+            sudo mkdir -p "$orig_dir"
+            sudo cp -rn "$BUNDLE_SRC/." "$orig_dir/" 2>/dev/null || warn "Some files may not have copied for $name"
+            ok "/home/$name restored"; log_import "RESTORED: /home/$name"
+        fi
+    done
+fi
+
 if [[ "$IMP_NO_CUPS" == false ]] && [[ -d "$BUNDLE/cups" ]] && [[ -n "$(ls "$BUNDLE/cups/" 2>/dev/null)" ]]; then
     CUPS_Q=$(grep -c "^<Printer " "$BUNDLE/cups/printers.conf" 2>/dev/null || echo 0)
     step "CUPS printers ($CUPS_Q queues)..."
@@ -3088,11 +3237,12 @@ echo ""
 echo -e "  ${YELLOW}Manual steps remaining:${RESET}"
 echo "    • Copy SSH private keys and chmod 600 ~/.ssh/id_*"
 echo "    • Add NFS fstab entries if needed"
-echo "    • Reboot"
 echo "    • tailscale up"
 echo "    • Re-pair Syncthing devices"
 echo "    • Enable GNOME extensions via Extensions app"
+echo "      (Settings → Extensions — they are installed but off by default)"
 echo "    • Verify GPU drivers"
+echo "    • Reboot  ← required for services to start correctly"
 echo ""
 
 fi # [[ "$MODE" == "import" ]]

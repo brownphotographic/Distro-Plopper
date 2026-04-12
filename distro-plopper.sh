@@ -750,9 +750,9 @@ for xdg in DESKTOP DOWNLOAD TEMPLATES PUBLICSHARE DOCUMENTS MUSIC PICTURES VIDEO
     DIR=$(xdg-user-dir "$xdg" 2>/dev/null || true)
     # Skip if xdg-user-dir returned $HOME itself (dir not configured) or doesn't exist
     [[ -z "$DIR" || "$DIR" == "$HOME" || ! -d "$DIR" ]] && continue
-    SIZE=$(du -sh "$DIR" 2>/dev/null | awk '{print $1}' | tr -d '[:space:]' || echo "?")
     BYTES=$(du -sb "$DIR" 2>/dev/null | awk '{print $1}' | tr -d '[:space:]' || echo 0)
     BYTES=${BYTES:-0}
+    SIZE=$(numfmt --to=iec "$BYTES" 2>/dev/null || echo "?")
     echo "$xdg|$DIR|$SIZE|$BYTES" >> "$SCAN_TMP/home-dirs.txt"
     HOME_DIRS_BYTES=$(( HOME_DIRS_BYTES + BYTES ))
     ok "Home dir: $xdg → $(basename "$DIR") ($SIZE)"
@@ -768,9 +768,9 @@ info "Scanning /home/ user directories..."
 for d in /home/*/; do
     [[ ! -d "$d" ]] && continue
     NAME=$(basename "$d")
-    SIZE=$(du -sh "$d" 2>/dev/null | awk '{print $1}' | tr -d '[:space:]' || echo "?")
     BYTES=$(du -sb "$d" 2>/dev/null | awk '{print $1}' | tr -d '[:space:]' || echo 0)
     BYTES=${BYTES:-0}
+    SIZE=$(numfmt --to=iec "$BYTES" 2>/dev/null || echo "?")
     LABEL="$NAME ($SIZE)"
     [[ "$d" == "$HOME/" || "$d" == "${HOME}/" ]] && LABEL="$NAME ($SIZE) ← current user"
     echo "$NAME|$d|$SIZE|$BYTES" >> "$SCAN_TMP/user-homes.txt"
@@ -1632,14 +1632,14 @@ log_md "| Directory | Size | Copied |"; log_md "|-----------|------|--------|"
 SKIP_LOCAL=("Steam" "Trash" "gvfs" "recently-used.xbel" "recently-used" "recently_used.xbel")
 while read -r dir; do
     NAME=$(basename "$dir")
-    SIZE=$(du -sh "$dir" 2>/dev/null | tail -1 | awk '{print $1}' | tr -d '\n\r' || echo "?")
+    DIR_BYTES=$(du -sb "$dir" 2>/dev/null | tail -1 | awk '{print $1}' | tr -d '[:space:]' || echo 0)
+    SIZE=$(numfmt --to=iec "${DIR_BYTES:-0}" 2>/dev/null || echo "?")
     SKIP=false
     for s in "${SKIP_LOCAL[@]}"; do [[ "$NAME" == "$s" ]] && SKIP=true && break; done
     if [[ "$SKIP" == true ]]; then
         log_md "| \`$NAME\` | $SIZE | ⬜ excluded |"
     else
         # Use spinner for dirs over 100MB
-        DIR_BYTES=$(du -sb "$dir" 2>/dev/null | tail -1 | awk '{print $1}' | tr -d '[:space:]' || echo 0)
         if [[ "$DIR_BYTES" -gt 104857600 ]]; then
             copy_with_spinner "~/.local/share/$NAME ($SIZE)" "$dir" "$OUTPUT_DIR/configs/local-share/"
         else
@@ -2108,8 +2108,8 @@ CHECKLIST
 # Set ARCHIVE path now that OUTPUT_DIR is finalised
 ARCHIVE="$(dirname "$OUTPUT_DIR")/distro-plopper-$TIMESTAMP.tar.gz"
 header "PHASE 4: Archive..."
-BUNDLE_SIZE=$(du -sh "$OUTPUT_DIR" 2>/dev/null | tail -1 | awk '{print $1}' || echo "?")
 BUNDLE_BYTES=$(du -sb "$OUTPUT_DIR" 2>/dev/null | tail -1 | awk '{print $1}' || echo "0")
+BUNDLE_SIZE=$(numfmt --to=iec "${BUNDLE_BYTES:-0}" 2>/dev/null || echo "?")
 ARCHIVE_SIZE="n/a"
 
 run_archive() {

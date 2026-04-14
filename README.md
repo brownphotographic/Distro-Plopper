@@ -58,6 +58,11 @@ distro-plopper scans your current system and bundles everything into a portable 
 
 ## Usage
 
+Download, then right click and select 'Run as a Program'. Suggest installing whiptail when prompted to give you an interactive UI.
+
+Or if you prefer the terminal, run without arguments to get the interactive mode selector:
+bash distro-plopper.sh
+
 ```bash
 # Export this system
 bash distro-plopper.sh --export
@@ -78,7 +83,7 @@ bash distro-plopper.sh --import --bundle ~/distro-plopper-20250101_120000.tar.gz
 bash distro-plopper.sh --import --bundle ~/bundle --dry-run
 ```
 
-Run without arguments to get the interactive mode selector.
+
 
 ### Export options
 | Flag | Description |
@@ -122,4 +127,4 @@ The honest limitation — if you already keep a good home folder backup (Timeshi
 
 ---
 
-MIT License — Copyright (c) 2025 Rob Brown
+MIT License — Copyright (c) 2026 Rob Brown

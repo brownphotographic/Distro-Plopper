@@ -10,7 +10,7 @@
 # distro-plopper — Export your Linux desktop setup. Plop it onto a new distro.
 #
 # MIT License
-# Copyright (c) 2025 Rob Brown
+# Copyright (c) 2026 Rob Brown
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -413,53 +413,55 @@ header "PHASE 1: Scanning system..."
 SCAN_TMP=$(mktemp -d)
 trap '_pause_if_fm; rm -rf "$SCAN_TMP"' EXIT
 
-# S1. Pacman
+# S1. Packages
 info "Scanning packages (${PKG_MANAGER})..."
-touch "$SCAN_TMP/$PKG_EXPLICIT_FILE" "$SCAN_TMP/$PKG_NATIVE_FILE" "$SCAN_TMP/$PKG_FOREIGN_FILE"
+> "$SCAN_TMP/apps.txt"
+> "$SCAN_TMP/cli-tools.txt"
 
 if [[ "$PKG_MANAGER" != "unknown" ]]; then
-    eval "$PKG_QUERY_EXPLICIT" > "$SCAN_TMP/$PKG_EXPLICIT_FILE" 2>/dev/null || true
-    eval "$PKG_QUERY_NATIVE"   > "$SCAN_TMP/$PKG_NATIVE_FILE"   2>/dev/null || true
-    [[ -n "$PKG_QUERY_FOREIGN" ]] && eval "$PKG_QUERY_FOREIGN" > "$SCAN_TMP/$PKG_FOREIGN_FILE" 2>/dev/null || true
+    # Build full explicit list
+    _EXPLICIT_TMP=$(mktemp)
+    eval "$PKG_QUERY_EXPLICIT" > "$_EXPLICIT_TMP" 2>/dev/null || true
 
-    if [[ "$PKG_FAMILY" == "fedora" ]]; then
-        dnf repoquery --userinstalled --queryformat "%{name} [%{reponame}]" 2>/dev/null \
-            | grep -v "@System\|@commandline" > "$SCAN_TMP/dnf-with-repos.txt" || true
-    fi
+    # Find packages that own a .desktop file — these are the "apps"
+    _DESKTOP_OWNERS=$(mktemp)
+    case "$PKG_FAMILY" in
+        arch)
+            pacman -Qqo /usr/share/applications/*.desktop 2>/dev/null \
+                | sort -u > "$_DESKTOP_OWNERS" || true
+            ;;
+        fedora)
+            rpm -qf /usr/share/applications/*.desktop 2>/dev/null \
+                | grep -v "not owned" | sed 's/-[0-9].*//' \
+                | sort -u > "$_DESKTOP_OWNERS" || true
+            ;;
+        debian)
+            dpkg -S /usr/share/applications/*.desktop 2>/dev/null \
+                | cut -d: -f1 | sort -u > "$_DESKTOP_OWNERS" || true
+            ;;
+        suse)
+            rpm -qf /usr/share/applications/*.desktop 2>/dev/null \
+                | grep -v "not owned" | sed 's/-[0-9].*//' \
+                | sort -u > "$_DESKTOP_OWNERS" || true
+            ;;
+    esac
 
-    if [[ "$PKG_FAMILY" == "debian" ]]; then
-        # Find packages from PPAs/unofficial sources by checking apt-cache policy
-        > "$SCAN_TMP/$PKG_FOREIGN_FILE"
-        while IFS= read -r pkg; do
-            ORIGIN=$(apt-cache policy "$pkg" 2>/dev/null \
-                | awk '/Installed:/{found=1} found && /http/{print $2; exit}' || true)
-            if [[ -n "$ORIGIN" ]] && ! echo "$ORIGIN" \
-                | grep -qE "archive\.ubuntu\.com|security\.ubuntu\.com|packages\.debian\.org|deb\.debian\.org|ports\.ubuntu\.com|archive\.canonical\.com"; then
-                echo "$pkg  # $ORIGIN" >> "$SCAN_TMP/$PKG_FOREIGN_FILE"
-            fi
-        done < "$SCAN_TMP/$PKG_EXPLICIT_FILE"
+    # apps = explicitly installed AND owns a .desktop (excludes dep-only packages)
+    comm -12 <(sort "$_EXPLICIT_TMP") <(sort "$_DESKTOP_OWNERS") \
+        > "$SCAN_TMP/apps.txt" || true
+    # CLI tools = explicitly installed but no .desktop file
+    comm -23 <(sort "$_EXPLICIT_TMP") <(sort "$_DESKTOP_OWNERS") \
+        > "$SCAN_TMP/cli-tools.txt" || true
+    rm -f "$_DESKTOP_OWNERS"
 
-        # Capture PPA list for Ubuntu and derivatives
-        > "$SCAN_TMP/ppa-list.txt"
-        > "$SCAN_TMP/ppa-sources.txt"
-        if [[ "$PKG_SUBFAMILY" == "ubuntu" ]]; then
-            find /etc/apt/sources.list.d -name "*.list" -o -name "*.sources" 2>/dev/null \
-                | xargs grep -h "^deb " 2>/dev/null | grep -v "^#" >> "$SCAN_TMP/ppa-list.txt" || true
-            grep -rh "ppa.launchpad.net" /etc/apt/sources.list.d/ 2>/dev/null \
-                | grep -v "^#" \
-                | sed 's|.*ppa\.launchpad\.net/\([^/]*/[^/]*\)/.*|ppa:\1|' \
-                | sort -u >> "$SCAN_TMP/ppa-sources.txt" || true
-            PPA_COUNT=$(wc -l < "$SCAN_TMP/ppa-sources.txt" 2>/dev/null || echo 0)
-            [[ "$PPA_COUNT" -gt 0 ]] && ok "PPAs: $PPA_COUNT found"
-        fi
-    fi
-    SCAN_RESULTS[pacman_total]=$(wc -l < "$SCAN_TMP/$PKG_EXPLICIT_FILE")
-    SCAN_RESULTS[pacman_native]=$(wc -l < "$SCAN_TMP/$PKG_NATIVE_FILE")
-    SCAN_RESULTS[pacman_aur]=$(wc -l < "$SCAN_TMP/$PKG_FOREIGN_FILE")
-    ok "${PKG_MANAGER}: ${SCAN_RESULTS[pacman_total]} explicit (${SCAN_RESULTS[pacman_native]} native, ${SCAN_RESULTS[pacman_aur]} foreign)"
+    SCAN_RESULTS[pacman_apps]=$(wc -l < "$SCAN_TMP/apps.txt")
+    SCAN_RESULTS[pacman_cli]=$(wc -l < "$SCAN_TMP/cli-tools.txt")
+    SCAN_RESULTS[pacman_total]=$(( SCAN_RESULTS[pacman_apps] + SCAN_RESULTS[pacman_cli] ))
+    rm -f "$_EXPLICIT_TMP"
+    ok "${PKG_MANAGER}: ${SCAN_RESULTS[pacman_apps]} apps, ${SCAN_RESULTS[pacman_cli]} CLI tools"
 else
     WARNINGS+=("No supported package manager found (tried pacman/dnf/apt/zypper/emerge)")
-    SCAN_RESULTS[pacman_total]=0; SCAN_RESULTS[pacman_native]=0; SCAN_RESULTS[pacman_aur]=0
+    SCAN_RESULTS[pacman_total]=0; SCAN_RESULTS[pacman_apps]=0; SCAN_RESULTS[pacman_cli]=0
 fi
 
 # S2. Flatpak
@@ -802,9 +804,8 @@ cat > "$SM" << SMEOF
 
 | Category | Count |
 |----------|-------|
-| ${PKG_MANAGER} explicit | ${SCAN_RESULTS[pacman_total]:-0} |
-| — Native repos | ${SCAN_RESULTS[pacman_native]:-0} |
-| — Foreign / 3rd-party | ${SCAN_RESULTS[pacman_aur]:-0} |
+| ${PKG_MANAGER} apps | ${SCAN_RESULTS[pacman_apps]:-0} |
+| ${PKG_MANAGER} CLI tools | ${SCAN_RESULTS[pacman_cli]:-0} |
 | Flatpak apps | ${SCAN_RESULTS[flatpak_count]:-0} |
 | AppImages | ${SCAN_RESULTS[appimage_count]:-0} |
 
@@ -1110,7 +1111,7 @@ echo -e "${BOLD}  SCAN COMPLETE — Full System Inventory${RESET}"
 echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
 echo ""
 printf "  ${CYAN}%-30s${RESET}\n" "PACKAGES"
-printf "  %-30s %s\n" "${PKG_MANAGER^} packages:" "${SCAN_RESULTS[pacman_total]:-0} (${SCAN_RESULTS[pacman_native]:-0} native, ${SCAN_RESULTS[pacman_aur]:-0} foreign)"
+printf "  %-30s %s\n" "${PKG_MANAGER^} packages:" "${SCAN_RESULTS[pacman_apps]:-0} apps, ${SCAN_RESULTS[pacman_cli]:-0} CLI tools"
 printf "  %-30s %s\n" "Flatpak apps:"     "${SCAN_RESULTS[flatpak_count]:-0}  (data: ${SCAN_RESULTS[flatpak_data_size]:-?})"
 printf "  %-30s %s\n" "AppImages:"        "${SCAN_RESULTS[appimage_count]:-0}"
 echo ""
@@ -1171,7 +1172,7 @@ whiptail --title "🪣  Distro Plopper — Export" \
 System scan complete. Here's what was found:
 
   Packages
-    ${PKG_MANAGER^}: ${SCAN_RESULTS[pacman_total]:-0} explicit (${SCAN_RESULTS[pacman_native]:-0} native, ${SCAN_RESULTS[pacman_aur]:-0} foreign)
+    ${PKG_MANAGER^}: ${SCAN_RESULTS[pacman_apps]:-0} apps, ${SCAN_RESULTS[pacman_cli]:-0} CLI tools
     Flatpak:  ${SCAN_RESULTS[flatpak_count]:-0} apps  (data: ${SCAN_RESULTS[flatpak_data_size]:-?})
     AppImages:${SCAN_RESULTS[appimage_count]:-0} found
 
@@ -1561,30 +1562,21 @@ header "PHASE 3: Copying files..."
 # ── Packages ──────────────────────────────────────────────────────────────────
 if [[ "$EXP_PACKAGES" == true ]]; then
 section_md "1. Packages"
-cp "$SCAN_TMP/$PKG_EXPLICIT_FILE" "$OUTPUT_DIR/packages/" 2>/dev/null || true
-cp "$SCAN_TMP/$PKG_NATIVE_FILE"   "$OUTPUT_DIR/packages/" 2>/dev/null || true
-cp "$SCAN_TMP/$PKG_FOREIGN_FILE"  "$OUTPUT_DIR/packages/" 2>/dev/null || true
+cp "$SCAN_TMP/apps.txt"      "$OUTPUT_DIR/packages/" 2>/dev/null || true
+cp "$SCAN_TMP/cli-tools.txt" "$OUTPUT_DIR/packages/" 2>/dev/null || true
 cp "$SCAN_TMP"/flatpak-*.txt "$OUTPUT_DIR/packages/" 2>/dev/null || true
 cp "$SCAN_TMP/appimages.txt"  "$OUTPUT_DIR/packages/" 2>/dev/null || true
 cp "$SCAN_TMP/pip-user.txt" "$SCAN_TMP/pipx.txt" "$SCAN_TMP/npm-global.txt" "$OUTPUT_DIR/packages/" 2>/dev/null || true
-[[ -f "$SCAN_TMP/dnf-with-repos.txt" ]] && cp "$SCAN_TMP/dnf-with-repos.txt" "$OUTPUT_DIR/packages/" || true
-echo "packages_present=true"              >> "$MANIFEST"
-echo "pkg_manager=$PKG_MANAGER"           >> "$MANIFEST"
-echo "pkg_family=$PKG_FAMILY"             >> "$MANIFEST"
-echo "pkg_native_file=$PKG_NATIVE_FILE"   >> "$MANIFEST"
-echo "pkg_foreign_file=$PKG_FOREIGN_FILE" >> "$MANIFEST"
-echo "pkg_explicit_file=$PKG_EXPLICIT_FILE" >> "$MANIFEST"
-echo "foreign_count=${SCAN_RESULTS[pacman_aur]:-0}" >> "$MANIFEST"
+echo "packages_present=true"                        >> "$MANIFEST"
+echo "pkg_manager=$PKG_MANAGER"                     >> "$MANIFEST"
+echo "pkg_family=$PKG_FAMILY"                       >> "$MANIFEST"
+echo "pkg_apps_file=apps.txt"                       >> "$MANIFEST"
 echo "flatpak_count=${SCAN_RESULTS[flatpak_count]:-0}" >> "$MANIFEST"
-INSTALL_CMD_HINT="$PKG_INSTALL < packages/$PKG_NATIVE_FILE"
-[[ "$PKG_FAMILY" == "arch" ]]   && INSTALL_CMD_HINT="sudo pacman -S --needed - < packages/$PKG_NATIVE_FILE"
-[[ "$PKG_FAMILY" == "debian" ]] && INSTALL_CMD_HINT="xargs sudo apt install -y < packages/$PKG_NATIVE_FILE"
-[[ "$PKG_FAMILY" == "fedora" ]] && INSTALL_CMD_HINT="xargs sudo dnf install -y < packages/$PKG_NATIVE_FILE"
-note_md "Restore ${PKG_MANAGER}: \`$INSTALL_CMD_HINT\`"
-[[ "$PKG_FAMILY" == "arch" ]] && note_md "Restore AUR: \`yay -S --needed - < packages/$PKG_FOREIGN_FILE\`"
+note_md "Restore apps: \`$PKG_INSTALL < packages/apps.txt\`"
 note_md "Restore Flatpak: \`flatpak install \$(cat packages/flatpak-apps.txt)\`"
-log_md "### ${PKG_MANAGER^}: ${SCAN_RESULTS[pacman_total]:-0} explicit"
-log_md '```'; cat "$SCAN_TMP/$PKG_FOREIGN_FILE" >> "$MD"; log_md '```'
+log_md "### ${PKG_MANAGER^}: ${SCAN_RESULTS[pacman_apps]:-0} apps, ${SCAN_RESULTS[pacman_cli]:-0} CLI tools"
+log_md "#### Apps"; log_md '```'; cat "$SCAN_TMP/apps.txt" >> "$MD"; log_md '```'
+log_md "#### CLI tools (reference only)"; log_md '```'; cat "$SCAN_TMP/cli-tools.txt" >> "$MD"; log_md '```'
 log_md "### Flatpak: ${SCAN_RESULTS[flatpak_count]:-0} apps"
 log_md '```'; cat "$SCAN_TMP/flatpak-full.txt" >> "$MD"; log_md '```'
 log_md "### AppImages"
@@ -1749,7 +1741,7 @@ fi # EXP_GNOME
 if [[ "$EXP_NFS" == true ]]; then
 section_md "8. NFS"
 [[ -f /etc/exports ]] && cp /etc/exports "$OUTPUT_DIR/nfs/exports" 2>/dev/null || true
-cp /etc/fstab "$OUTPUT_DIR/nfs/fstab" 2>/dev/null || true
+grep -E '\bnfs\b|\bnfs4\b' /etc/fstab 2>/dev/null > "$OUTPUT_DIR/nfs/fstab-nfs-lines" || true
 echo "nfs_exports=${SCAN_RESULTS[nfs_exports]:-false}" >> "$MANIFEST"
 echo "nfs_mounts=${SCAN_RESULTS[nfs_mounts]:-false}" >> "$MANIFEST"
 log_md "### /etc/exports"; log_md '```'
@@ -2075,7 +2067,7 @@ cat >> "$MD" << 'CHECKLIST'
 
 ### NFS
 - [ ] Restore `/etc/exports` → `sudo exportfs -ra`
-- [ ] Add fstab entries → `sudo mount -a`
+- [ ] NFS fstab lines inserted automatically; daemon-reload and mount -a run
 
 ### Fonts
 - [ ] `cp -r fonts/. ~/.local/share/fonts/ && fc-cache -fv`
@@ -2262,18 +2254,25 @@ do_copy() {
 SRC_PKG_MANAGER=$(get_manifest "pkg_manager" "pacman")
 SRC_PKG_FAMILY=$(get_manifest "pkg_family" "arch")
 SRC_PKG_SUBFAMILY=$(get_manifest "pkg_subfamily" "")
-SRC_PKG_NATIVE_FILE=$(get_manifest "pkg_native_file" "pacman-native.txt")
-SRC_PKG_FOREIGN_FILE=$(get_manifest "pkg_foreign_file" "pacman-aur.txt")
-SRC_PKG_EXPLICIT_FILE=$(get_manifest "pkg_explicit_file" "pacman-explicit.txt")
-
 # Determine install commands for the CURRENT (target) system
 detect_distro  # re-run to get current system pkg manager
 SAME_FAMILY=false
 [[ "$PKG_FAMILY" == "$SRC_PKG_FAMILY" ]] && SAME_FAMILY=true
 
+# Prefer new-style apps.txt; fall back to old-style native file for older bundles
+PKG_INSTALL_FILE=""
+PKG_INSTALL_OLD_FORMAT=false
+if [[ -f "$BUNDLE/packages/apps.txt" ]]; then
+    PKG_INSTALL_FILE="$BUNDLE/packages/apps.txt"
+else
+    SRC_PKG_NATIVE_FILE=$(get_manifest "pkg_native_file" "pacman-native.txt")
+    [[ -f "$BUNDLE/packages/$SRC_PKG_NATIVE_FILE" ]] && PKG_INSTALL_FILE="$BUNDLE/packages/$SRC_PKG_NATIVE_FILE"
+    PKG_INSTALL_OLD_FORMAT=true
+fi
 NATIVE_COUNT=0
+[[ -n "$PKG_INSTALL_FILE" ]] && NATIVE_COUNT=$(wc -l < "$PKG_INSTALL_FILE")
 AUR_COUNT=0
-[[ -f "$BUNDLE/packages/$SRC_PKG_NATIVE_FILE"  ]] && NATIVE_COUNT=$(wc -l < "$BUNDLE/packages/$SRC_PKG_NATIVE_FILE")
+SRC_PKG_FOREIGN_FILE=$(get_manifest "pkg_foreign_file" "${SRC_PKG_MANAGER}-foreign.txt")
 [[ -f "$BUNDLE/packages/$SRC_PKG_FOREIGN_FILE" ]] && AUR_COUNT=$(wc -l < "$BUNDLE/packages/$SRC_PKG_FOREIGN_FILE")
 FLATPAK_COUNT=0; [[ -f "$BUNDLE/packages/flatpak-apps.txt"  ]] && FLATPAK_COUNT=$(wc -l < "$BUNDLE/packages/flatpak-apps.txt")
 APPIMAGE_COUNT=0;[[ -f "$BUNDLE/packages/appimages.txt"     ]] && APPIMAGE_COUNT=$(wc -l < "$BUNDLE/packages/appimages.txt")
@@ -2291,6 +2290,10 @@ HAS_HOMEDIRS=$(   [[ -d "$BUNDLE/homedirs"           ]] && echo true || echo fal
 HAS_USERHOMES=$(  [[ -d "$BUNDLE/user-homes"        ]] && echo true || echo false)
 NFS_EXP=$(get_manifest "nfs_exports" "false")
 NFS_MNT=$(get_manifest "nfs_mounts"  "false")
+# Support both new bundles (fstab-nfs-lines) and old bundles (full fstab)
+NFS_FSTAB_FILE=""
+[[ -f "$BUNDLE/nfs/fstab-nfs-lines" ]] && NFS_FSTAB_FILE="$BUNDLE/nfs/fstab-nfs-lines"
+[[ -z "$NFS_FSTAB_FILE" && -f "$BUNDLE/nfs/fstab" ]] && NFS_FSTAB_FILE="$BUNDLE/nfs/fstab"
 
 SOURCE_OS=$(grep "^# Source OS:" "$MANIFEST" 2>/dev/null | cut -d: -f2- | xargs || echo "unknown")
 SOURCE_HOST=$(grep "^# Source host:" "$MANIFEST" 2>/dev/null | cut -d: -f2- | xargs || echo "unknown")
@@ -2395,7 +2398,7 @@ if [[ "$NFS_IN_BUNDLE" == "yes" ]]; then
     PREFLIGHT_MSG+="NFS:\n"
     PREFLIGHT_MSG+="─────────────────────────────────────────────\n"
     PREFLIGHT_MSG+="□  NFS server(s) are reachable on the network\n"
-    PREFLIGHT_MSG+="   (fstab entries shown at end — manual step)\n"
+    PREFLIGHT_MSG+="   (NFS fstab lines will be inserted automatically)\n"
 fi
 
 PREFLIGHT_MSG+="\n─────────────────────────────────────────────\n"
@@ -2462,80 +2465,26 @@ INSTALL_NATIVE=false
 CROSS_DISTRO_WARNING=""
 [[ "$SAME_FAMILY" == false ]] && CROSS_DISTRO_WARNING="
 NOTE: Source was ${SRC_PKG_FAMILY} (${SRC_PKG_MANAGER}), this system is
-${PKG_FAMILY} (${PKG_MANAGER}). Package names may differ — review the list
-carefully and uncheck anything that looks wrong."
+${PKG_FAMILY} (${PKG_MANAGER}). App names are usually the same across distros
+but some may not exist — failures will be skipped with a warning."
 
-if [[ "$IMP_NO_PACKAGES" == false ]] && [[ -f "$BUNDLE/packages/$SRC_PKG_NATIVE_FILE" ]]; then
-    case "$PKG_FAMILY" in
-        arch)   INSTALL_HINT="sudo pacman -S --needed - < ${SRC_PKG_NATIVE_FILE}" ;;
-        fedora) INSTALL_HINT="xargs sudo dnf install -y < ${SRC_PKG_NATIVE_FILE}" ;;
-        debian) INSTALL_HINT="xargs sudo apt install -y < ${SRC_PKG_NATIVE_FILE}" ;;
-        suse)   INSTALL_HINT="xargs sudo zypper install -y < ${SRC_PKG_NATIVE_FILE}" ;;
-        *)      INSTALL_HINT="(unknown package manager — install manually)" ;;
-    esac
-    whiptail --title "Stage 1 of 2: Packages — Native ($NATIVE_COUNT packages)" \
+if [[ "$IMP_NO_PACKAGES" == false ]] && [[ -n "$PKG_INSTALL_FILE" ]]; then
+    OLD_NOTE=""
+    [[ "$PKG_INSTALL_OLD_FORMAT" == true ]] && OLD_NOTE="
+(Legacy bundle — using full package list. Some packages may not exist on this distro.)"
+    whiptail --title "Stage 1 of 2: Packages ($NATIVE_COUNT apps)" \
       --yesno "\
-$NATIVE_COUNT packages from the source system.${CROSS_DISTRO_WARNING}
+$NATIVE_COUNT apps from the source system.${CROSS_DISTRO_WARNING}${OLD_NOTE}
 
-Install command:
-  ${INSTALL_HINT}
-
-Already-installed packages will be skipped where supported.
+Will install using: ${PKG_MANAGER}
+Already-installed packages will be skipped.
 This may take a while depending on how many need downloading.
 
-Install native packages?" \
+Install packages?" \
       $BOX_H $BOX_W && INSTALL_NATIVE=true || true
 fi
 
-# ── AUR / foreign packages checklist ─────────────────────────────────────────
-declare -a SELECTED_AUR=()
-if [[ "$IMP_NO_PACKAGES" == false ]] && [[ -f "$BUNDLE/packages/$SRC_PKG_FOREIGN_FILE" ]] && [[ "$AUR_COUNT" -gt 0 ]]; then
-    if [[ "$PKG_FAMILY" != "arch" ]]; then
-        whiptail --title "Foreign Packages — Cross-Distro Import" \
-          --msgbox "\
-$AUR_COUNT foreign packages from the source (${SRC_PKG_MANAGER}).
-
-This system uses ${PKG_MANAGER} (${PKG_FAMILY}). These packages cannot be
-auto-installed cross-distro — names and availability differ.
-
-Review the list and install equivalents manually:
-  $BUNDLE/packages/$SRC_PKG_FOREIGN_FILE
-
-$(cat "$BUNDLE/packages/$SRC_PKG_FOREIGN_FILE" | head -15)
-$([ "$AUR_COUNT" -gt 15 ] && echo "  ... and $(( AUR_COUNT - 15 )) more")" \
-          $BOX_H $BOX_W
-    elif [[ -z "$AUR_HELPER" ]]; then
-        whiptail --title "AUR Packages — No AUR Helper Found" \
-          --msgbox "\
-$AUR_COUNT AUR packages found, but no AUR helper (yay or paru) installed.
-
-Install yay or paru first, then re-run the import.
-
-Your AUR packages:
-$(cat "$BUNDLE/packages/$SRC_PKG_FOREIGN_FILE" | head -20)
-$([ "$AUR_COUNT" -gt 20 ] && echo "  ... and $(( AUR_COUNT - 20 )) more")" \
-          $BOX_H $BOX_W
-    else
-        CHECKLIST_ARGS=()
-        while read -r pkg; do
-            CHECKLIST_ARGS+=("$pkg" "" "ON")
-        done < "$BUNDLE/packages/$SRC_PKG_FOREIGN_FILE"
-
-        AUR_CHOICES=$(whiptail --title "Stage 1 of 2: AUR/Foreign Packages ($AUR_COUNT found)" \
-          --checklist \
-"Select packages to install via $AUR_HELPER.
-All pre-selected. Uncheck any you do not want.
-Space = toggle  |  Tab = move to OK/Cancel  |  Enter = confirm  |  Esc = cancel" \
-          $BOX_H $BOX_W $(( BOX_H - 10 )) \
-          "${CHECKLIST_ARGS[@]}" \
-          3>&1 1>&2 2>&3) || true
-
-        if [[ -n "$AUR_CHOICES" ]]; then
-            read -ra SELECTED_AUR <<< "$AUR_CHOICES"
-            SELECTED_AUR=("${SELECTED_AUR[@]//\"/}")
-        fi
-    fi
-fi
+declare -a SELECTED_AUR=()  # retained for summary line compatibility
 
 # ── Flatpak checklist ─────────────────────────────────────────────────────────
 declare -a SELECTED_FLATPAK=()
@@ -2606,13 +2555,28 @@ if [[ "$DO_INSTALL" == true ]]; then
         echo ""
         header "Installing packages via ${PKG_MANAGER} ($NATIVE_COUNT)..."
         case "$PKG_FAMILY" in
-            arch)   sudo pacman -S --needed - < "$BUNDLE/packages/$SRC_PKG_NATIVE_FILE" 2>&1 | tee -a "$IMPORT_LOG" || warn "Some packages failed" ;;
-            fedora) xargs sudo dnf install -y < "$BUNDLE/packages/$SRC_PKG_NATIVE_FILE" 2>&1 | tee -a "$IMPORT_LOG" || warn "Some packages failed" ;;
-            debian) xargs sudo apt install -y < "$BUNDLE/packages/$SRC_PKG_NATIVE_FILE" 2>&1 | tee -a "$IMPORT_LOG" || warn "Some packages failed" ;;
-            suse)   xargs sudo zypper install -y < "$BUNDLE/packages/$SRC_PKG_NATIVE_FILE" 2>&1 | tee -a "$IMPORT_LOG" || warn "Some packages failed" ;;
-            *)      warn "Unknown package manager — install manually from $BUNDLE/packages/$SRC_PKG_NATIVE_FILE" ;;
+            arch)
+                # Capture packages pacman can't find (AUR), try AUR helper for those
+                _PACMAN_FAILED=$(mktemp)
+                sudo pacman -S --needed - < "$PKG_INSTALL_FILE" 2>&1 \
+                    | tee -a "$IMPORT_LOG" \
+                    | grep "^error: target not found:" \
+                    | sed 's/error: target not found: //' > "$_PACMAN_FAILED" || true
+                if [[ -s "$_PACMAN_FAILED" ]] && [[ -n "$AUR_HELPER" ]]; then
+                    warn "$(wc -l < "$_PACMAN_FAILED") packages not in official repos — trying $AUR_HELPER..."
+                    $AUR_HELPER -S --needed - < "$_PACMAN_FAILED" 2>&1 | tee -a "$IMPORT_LOG" || warn "Some AUR packages failed"
+                elif [[ -s "$_PACMAN_FAILED" ]]; then
+                    warn "$(wc -l < "$_PACMAN_FAILED") packages not found — install an AUR helper (yay/paru) and retry"
+                    cat "$_PACMAN_FAILED"
+                fi
+                rm -f "$_PACMAN_FAILED"
+                ;;
+            fedora) xargs sudo dnf install -y < "$PKG_INSTALL_FILE" 2>&1 | tee -a "$IMPORT_LOG" || warn "Some packages failed" ;;
+            debian) xargs sudo apt install -y < "$PKG_INSTALL_FILE" 2>&1 | tee -a "$IMPORT_LOG" || warn "Some packages failed" ;;
+            suse)   xargs sudo zypper install -y < "$PKG_INSTALL_FILE" 2>&1 | tee -a "$IMPORT_LOG" || warn "Some packages failed" ;;
+            *)      warn "Unknown package manager — install manually from $PKG_INSTALL_FILE" ;;
         esac
-        ok "Native packages done"
+        ok "Packages done"
     fi
 
     if [[ "${#SELECTED_AUR[@]}" -gt 0 ]] && [[ "$PKG_FAMILY" == "arch" ]]; then
@@ -2656,6 +2620,7 @@ Add these PPAs now? (requires internet connection)" \
         header "Installing Flatpak apps (${#SELECTED_FLATPAK[@]})..."
         flatpak install --noninteractive "${SELECTED_FLATPAK[@]}" 2>&1 | tee -a "$IMPORT_LOG" || warn "Some Flatpak apps failed"
         ok "Flatpak apps done"
+        info "  Log out and back in for Flatpak apps to appear in your launcher"
     fi
 
     whiptail --title "✅ Packages Complete" \
@@ -2973,18 +2938,43 @@ Profile loading on login:
     fi
 fi
 
-# ── NFS notice ────────────────────────────────────────────────────────────────
+# ── NFS ───────────────────────────────────────────────────────────────────────
 NFS_MSG=""
 if [[ "$NFS_MNT" == "true" ]] || [[ "$NFS_EXP" == "true" ]]; then
-    NFS_MSG="NFS entries found — these need manual attention:\n\n"
-    [[ "$NFS_EXP" == "true" ]] && NFS_MSG+="  Server exports:\n  sudo cp $BUNDLE/nfs/exports /etc/exports\n  sudo exportfs -ra\n\n"
-    if [[ "$NFS_MNT" == "true" ]]; then
-        NFS_MSG+="  fstab mounts to add:\n"
-        while read -r line; do NFS_MSG+="  $line\n"; done < <(grep -E '\bnfs\b|\bnfs4\b' "$BUNDLE/nfs/fstab" 2>/dev/null)
+    [[ "$NFS_EXP" == "true" ]] && NFS_MSG+="Server exports — still manual:\n  sudo cp $BUNDLE/nfs/exports /etc/exports\n  sudo exportfs -ra\n\n"
+    if [[ "$NFS_MNT" == "true" ]] && [[ -n "$NFS_FSTAB_FILE" ]]; then
+        if [[ "$DRY_RUN" == false ]]; then
+            INSERTED=(); SKIPPED=()
+            while IFS= read -r line; do
+                [[ -z "$line" || "$line" == \#* ]] && continue
+                if grep -qF "$line" /etc/fstab 2>/dev/null; then
+                    SKIPPED+=("$line")
+                else
+                    echo "$line" | sudo tee -a /etc/fstab > /dev/null
+                    INSERTED+=("$line")
+                fi
+            done < <(grep -E '\bnfs\b|\bnfs4\b' "$NFS_FSTAB_FILE" 2>/dev/null)
+            if [[ ${#INSERTED[@]} -gt 0 ]]; then
+                NFS_MSG+="Added to /etc/fstab:\n"
+                for l in "${INSERTED[@]}"; do NFS_MSG+="  $l\n"; done
+                NFS_MSG+="\n"
+                sudo systemctl daemon-reload 2>/dev/null \
+                    && NFS_MSG+="✓ systemctl daemon-reload\n" \
+                    || NFS_MSG+="⚠ daemon-reload failed\n"
+                sudo mount -a 2>/dev/null \
+                    && NFS_MSG+="✓ mount -a\n" \
+                    || NFS_MSG+="⚠ mount -a failed — check NFS server is reachable\n"
+            fi
+            [[ ${#SKIPPED[@]} -gt 0 ]] && { NFS_MSG+="Already present (skipped):\n"; for l in "${SKIPPED[@]}"; do NFS_MSG+="  $l\n"; done; }
+        else
+            NFS_MSG+="[DRY RUN] Would add to /etc/fstab:\n"
+            while IFS= read -r line; do
+                [[ -z "$line" || "$line" == \#* ]] && continue
+                NFS_MSG+="  $line\n"
+            done < <(grep -E '\bnfs\b|\bnfs4\b' "$NFS_FSTAB_FILE" 2>/dev/null)
+        fi
     fi
-    whiptail --title "NFS — Manual Action Required" \
-      --msgbox "$NFS_MSG" \
-      $BOX_H $BOX_W
+    [[ -n "$NFS_MSG" ]] && whiptail --title "NFS" --msgbox "$NFS_MSG" $BOX_H $BOX_W
 fi
 
 # ── Final summary ─────────────────────────────────────────────────────────────
@@ -3039,35 +3029,36 @@ command -v paru &>/dev/null && AUR_HELPER="paru" || true
 if [[ "$IMP_NO_PACKAGES" == false ]]; then
     header "PHASE 2: Installing packages..."
 
-    if [[ -f "$BUNDLE/packages/$SRC_PKG_NATIVE_FILE" ]]; then
-        step "Native packages ($NATIVE_COUNT) via ${PKG_MANAGER}..."
+    if [[ -n "$PKG_INSTALL_FILE" ]]; then
+        [[ "$PKG_INSTALL_OLD_FORMAT" == true ]] && warn "Legacy bundle — using full package list; some names may not match this distro"
+        step "Packages ($NATIVE_COUNT) via ${PKG_MANAGER}..."
         if [[ "$DRY_RUN" == false ]]; then
             case "$PKG_FAMILY" in
-                arch)   sudo pacman -S --needed - < "$BUNDLE/packages/$SRC_PKG_NATIVE_FILE" 2>&1 | tee -a "$IMPORT_LOG" || warn "Some packages failed" ;;
-                fedora) xargs sudo dnf install -y < "$BUNDLE/packages/$SRC_PKG_NATIVE_FILE" 2>&1 | tee -a "$IMPORT_LOG" || warn "Some packages failed" ;;
-                debian) xargs sudo apt install -y < "$BUNDLE/packages/$SRC_PKG_NATIVE_FILE" 2>&1 | tee -a "$IMPORT_LOG" || warn "Some packages failed" ;;
-                suse)   xargs sudo zypper install -y < "$BUNDLE/packages/$SRC_PKG_NATIVE_FILE" 2>&1 | tee -a "$IMPORT_LOG" || warn "Some packages failed" ;;
-                *)      warn "Unknown package manager — install manually from $BUNDLE/packages/$SRC_PKG_NATIVE_FILE" ;;
+                arch)
+                    _PACMAN_FAILED=$(mktemp)
+                    sudo pacman -S --needed - < "$PKG_INSTALL_FILE" 2>&1 \
+                        | tee -a "$IMPORT_LOG" \
+                        | grep "^error: target not found:" \
+                        | sed 's/error: target not found: //' > "$_PACMAN_FAILED" || true
+                    if [[ -s "$_PACMAN_FAILED" ]] && [[ -n "$AUR_HELPER" ]]; then
+                        warn "$(wc -l < "$_PACMAN_FAILED") packages not in official repos — trying $AUR_HELPER..."
+                        $AUR_HELPER -S --needed - < "$_PACMAN_FAILED" 2>&1 | tee -a "$IMPORT_LOG" || warn "Some AUR packages failed"
+                    elif [[ -s "$_PACMAN_FAILED" ]]; then
+                        warn "$(wc -l < "$_PACMAN_FAILED") packages not found — install an AUR helper (yay/paru) and retry"
+                        cat "$_PACMAN_FAILED"
+                    fi
+                    rm -f "$_PACMAN_FAILED"
+                    ;;
+                fedora) xargs sudo dnf install -y < "$PKG_INSTALL_FILE" 2>&1 | tee -a "$IMPORT_LOG" || warn "Some packages failed" ;;
+                debian) xargs sudo apt install -y < "$PKG_INSTALL_FILE" 2>&1 | tee -a "$IMPORT_LOG" || warn "Some packages failed" ;;
+                suse)   xargs sudo zypper install -y < "$PKG_INSTALL_FILE" 2>&1 | tee -a "$IMPORT_LOG" || warn "Some packages failed" ;;
+                *)      warn "Unknown package manager — install manually from $PKG_INSTALL_FILE" ;;
             esac
         else
             info "[DRY RUN] would install $NATIVE_COUNT packages via ${PKG_MANAGER}"
         fi
     fi
 
-    if [[ -f "$BUNDLE/packages/$SRC_PKG_FOREIGN_FILE" ]] && [[ "$AUR_COUNT" -gt 0 ]]; then
-        if [[ "$PKG_FAMILY" == "arch" ]] && [[ -n "$AUR_HELPER" ]]; then
-            step "AUR packages ($AUR_COUNT)..."
-            [[ "$DRY_RUN" == false ]] \
-                && $AUR_HELPER -S --needed - < "$BUNDLE/packages/$SRC_PKG_FOREIGN_FILE" 2>&1 | tee -a "$IMPORT_LOG" \
-                || info "[DRY RUN] $AUR_HELPER -S --needed - < $SRC_PKG_FOREIGN_FILE"
-        elif [[ "$PKG_FAMILY" == "arch" ]]; then
-            warn "No AUR helper found — install yay or paru, then:"
-            warn "  yay -S --needed - < $BUNDLE/packages/$SRC_PKG_FOREIGN_FILE"
-        else
-            warn "Foreign packages from ${SRC_PKG_MANAGER} — install equivalents manually:"
-            warn "  $BUNDLE/packages/$SRC_PKG_FOREIGN_FILE"
-        fi
-    fi
 
     # Ubuntu/Debian fallback: re-add PPAs
     if [[ "$PKG_FAMILY" == "debian" ]] && [[ -f "$BUNDLE/packages/ppa-sources.txt" ]] && [[ -s "$BUNDLE/packages/ppa-sources.txt" ]]; then
@@ -3095,6 +3086,7 @@ if [[ "$IMP_NO_PACKAGES" == false ]]; then
         if command -v flatpak &>/dev/null; then
             [[ "$DRY_RUN" == false ]] \
                 && flatpak install --noninteractive $(cat "$BUNDLE/packages/flatpak-apps.txt") 2>&1 | tee -a "$IMPORT_LOG" \
+                && info "  Log out and back in for Flatpak apps to appear in your launcher" \
                 || info "[DRY RUN] flatpak install $FLATPAK_COUNT apps"
         else
             warn "Flatpak not installed — skipping"
@@ -3217,9 +3209,24 @@ if [[ "$IMP_NO_DISPLAYCAL" == false ]] && [[ -d "$BUNDLE/displaycal" ]] && [[ -n
     warn "DisplayCAL: same monitor = profile loads automatically. Different monitor = re-run calibration or use colormgr."
 fi
 
-if [[ "$NFS_MNT" == "true" ]]; then
-    warn "NFS fstab mounts — add these to /etc/fstab manually:"
-    grep -E '\bnfs\b|\bnfs4\b' "$BUNDLE/nfs/fstab" 2>/dev/null || true
+if [[ "$NFS_MNT" == "true" ]] && [[ -n "$NFS_FSTAB_FILE" ]]; then
+    if [[ "$DRY_RUN" == false ]]; then
+        info "NFS fstab mounts — inserting into /etc/fstab..."
+        while IFS= read -r line; do
+            [[ -z "$line" || "$line" == \#* ]] && continue
+            if grep -qF "$line" /etc/fstab 2>/dev/null; then
+                ok "  Already present: $line"
+            else
+                echo "$line" | sudo tee -a /etc/fstab > /dev/null
+                ok "  Added: $line"
+            fi
+        done < <(grep -E '\bnfs\b|\bnfs4\b' "$NFS_FSTAB_FILE" 2>/dev/null)
+        sudo systemctl daemon-reload 2>/dev/null && ok "systemctl daemon-reload" || warn "daemon-reload failed"
+        sudo mount -a 2>/dev/null && ok "NFS shares mounted" || warn "mount -a failed — check NFS server is reachable"
+    else
+        info "[DRY RUN] would add to /etc/fstab:"
+        grep -E '\bnfs\b|\bnfs4\b' "$NFS_FSTAB_FILE" 2>/dev/null | while IFS= read -r line; do info "  $line"; done
+    fi
 fi
 
 fi # end TUI/fallback
@@ -3236,7 +3243,7 @@ echo ""
 echo ""
 echo -e "  ${YELLOW}Manual steps remaining:${RESET}"
 echo "    • Copy SSH private keys and chmod 600 ~/.ssh/id_*"
-echo "    • Add NFS fstab entries if needed"
+echo "    • Verify NFS shares mounted  (fstab lines inserted; mount -a already run)"
 echo "    • tailscale up"
 echo "    • Re-pair Syncthing devices"
 echo "    • Enable GNOME extensions via Extensions app"

@@ -99,7 +99,11 @@ fi
 _pause_if_fm() {
     if [[ "$_LAUNCHED_FROM_FM" == true ]]; then
         echo ""
-        read -rp "  Press Enter to close..." _DUMMY || true
+        echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+        echo -e "${GREEN}${BOLD}  Script finished.${RESET}"
+        echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+        echo ""
+        read -rp "  Press Enter to close this window..." _DUMMY || true
     fi
 }
 trap _pause_if_fm EXIT
@@ -457,11 +461,13 @@ if [[ "$PKG_MANAGER" != "unknown" ]]; then
     SCAN_RESULTS[pacman_apps]=$(wc -l < "$SCAN_TMP/apps.txt")
     SCAN_RESULTS[pacman_cli]=$(wc -l < "$SCAN_TMP/cli-tools.txt")
     SCAN_RESULTS[pacman_total]=$(( SCAN_RESULTS[pacman_apps] + SCAN_RESULTS[pacman_cli] ))
+    SCAN_RESULTS[desktop_app_count]=$(ls /usr/share/applications/*.desktop 2>/dev/null | wc -l)
     rm -f "$_EXPLICIT_TMP"
-    ok "${PKG_MANAGER}: ${SCAN_RESULTS[pacman_apps]} apps, ${SCAN_RESULTS[pacman_cli]} CLI tools"
+    ok "${PKG_MANAGER}: ${SCAN_RESULTS[desktop_app_count]} desktop apps, ${SCAN_RESULTS[pacman_cli]} CLI tools (${SCAN_RESULTS[pacman_total]} packages total)"
 else
     WARNINGS+=("No supported package manager found (tried pacman/dnf/apt/zypper/emerge)")
     SCAN_RESULTS[pacman_total]=0; SCAN_RESULTS[pacman_apps]=0; SCAN_RESULTS[pacman_cli]=0
+    SCAN_RESULTS[desktop_app_count]=0
 fi
 
 # S2. Flatpak
@@ -1571,6 +1577,8 @@ echo "packages_present=true"                        >> "$MANIFEST"
 echo "pkg_manager=$PKG_MANAGER"                     >> "$MANIFEST"
 echo "pkg_family=$PKG_FAMILY"                       >> "$MANIFEST"
 echo "pkg_apps_file=apps.txt"                       >> "$MANIFEST"
+echo "desktop_app_count=${SCAN_RESULTS[desktop_app_count]:-0}" >> "$MANIFEST"
+echo "cli_count=${SCAN_RESULTS[pacman_cli]:-0}"     >> "$MANIFEST"
 echo "flatpak_count=${SCAN_RESULTS[flatpak_count]:-0}" >> "$MANIFEST"
 note_md "Restore apps: \`$PKG_INSTALL < packages/apps.txt\`"
 note_md "Restore Flatpak: \`flatpak install \$(cat packages/flatpak-apps.txt)\`"
@@ -2240,6 +2248,78 @@ else
 fi
 echo "distro-plopper import log — $(date)" > "$IMPORT_LOG"
 log_import() { echo "$*" >> "$IMPORT_LOG"; }
+# Override warn so failures are captured in the log as well as the terminal
+warn() { echo -e "${YELLOW}[WARN]${RESET}  $*"; echo "WARN: $*" >> "$IMPORT_LOG"; }
+
+# Manual steps collected dynamically during import
+MANUAL_STEPS=()
+add_manual() { MANUAL_STEPS+=("$*"); }
+
+# ── Helper: build and write the import summary file ──────────────────────────
+write_import_summary() {
+    local dest_path="$1"
+    local sep="═══════════════════════════════════════════════════════════"
+    mkdir -p "$(dirname "$dest_path")" 2>/dev/null || true
+    {
+        echo "$sep"
+        echo "  Distro Plopper — Import Summary"
+        echo "  $(date)"
+        echo "  From: $SOURCE_OS on $SOURCE_HOST"
+        echo "  To:   $(grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"') on $(hostname)"
+        echo "$sep"
+        echo ""
+
+        echo "✅  RESTORED SUCCESSFULLY"
+        local found=false
+        while IFS= read -r line; do
+            if [[ "$line" == RESTORED:* ]]; then
+                echo "    • ${line#RESTORED: }"
+                found=true
+            fi
+        done < "$IMPORT_LOG"
+        [[ "$found" == false ]] && echo "    (none)"
+        echo ""
+
+        echo "⚠️   SKIPPED / NEEDS ATTENTION"
+        found=false
+        while IFS= read -r line; do
+            if [[ "$line" == SKIPPED:* ]]; then
+                echo "    • ${line#SKIPPED: }"
+                found=true
+            fi
+        done < "$IMPORT_LOG"
+        [[ "$found" == false ]] && echo "    (none)"
+        echo ""
+
+        echo "❌  WARNINGS / FAILURES"
+        found=false
+        while IFS= read -r line; do
+            if [[ "$line" == WARN:* ]]; then
+                echo "    • ${line#WARN: }"
+                found=true
+            fi
+        done < "$IMPORT_LOG"
+        [[ "$found" == false ]] && echo "    (none)"
+        echo ""
+
+        echo "📋  MANUAL STEPS REMAINING"
+        echo "    • Copy SSH private keys:  cp ~/.ssh/id_* <here>  then  chmod 600 ~/.ssh/id_*"
+        echo "    • Re-authenticate Tailscale:  tailscale up"
+        echo "    • Re-pair Syncthing devices"
+        if [[ "${#MANUAL_STEPS[@]}" -gt 0 ]]; then
+            for _ms in "${MANUAL_STEPS[@]}"; do
+                echo "    • $_ms"
+            done
+        fi
+        echo "    • Reboot  (required for all services to start correctly)"
+        echo ""
+
+        echo "📄  FULL LOG"
+        echo "    $IMPORT_LOG"
+        echo ""
+        echo "$sep"
+    } > "$dest_path"
+}
 
 # ── Helper: copy with dry-run awareness ───────────────────────────────────────
 do_copy() {
@@ -2249,6 +2329,18 @@ do_copy() {
     [[ "$mode" == "--file" ]] && cp -n "$src" "$dest" 2>/dev/null || cp -rn "$src" "$dest" 2>/dev/null || true
 }
 
+# Like do_copy but for large directories: shows progress and prevents system sleep
+do_large_copy() {
+    local src="$1" dest="$2"
+    [[ "$DRY_RUN" == true ]] && { info "[DRY RUN] would copy: $src → $dest"; return; }
+    mkdir -p "$dest"
+    if command -v rsync &>/dev/null; then
+        rsync -a --ignore-existing --info=progress2 "$src" "$dest/" 2>&1 || true
+    else
+        cp -rn "$src" "$dest/" 2>/dev/null || true
+    fi
+}
+
 # ── Read bundle contents for display ─────────────────────────────────────────
 # Read package manager info from manifest
 SRC_PKG_MANAGER=$(get_manifest "pkg_manager" "pacman")
@@ -2256,6 +2348,13 @@ SRC_PKG_FAMILY=$(get_manifest "pkg_family" "arch")
 SRC_PKG_SUBFAMILY=$(get_manifest "pkg_subfamily" "")
 # Determine install commands for the CURRENT (target) system
 detect_distro  # re-run to get current system pkg manager
+case "$PKG_FAMILY" in
+    arch)   _DISTRO_LABEL="Arch" ;;
+    fedora) _DISTRO_LABEL="Fedora" ;;
+    debian) _DISTRO_LABEL="$(grep "^NAME=" /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"' | awk '{print $1}' || echo "Debian")" ;;
+    suse)   _DISTRO_LABEL="openSUSE" ;;
+    *)      _DISTRO_LABEL="$PKG_MANAGER" ;;
+esac
 SAME_FAMILY=false
 [[ "$PKG_FAMILY" == "$SRC_PKG_FAMILY" ]] && SAME_FAMILY=true
 
@@ -2271,6 +2370,17 @@ else
 fi
 NATIVE_COUNT=0
 [[ -n "$PKG_INSTALL_FILE" ]] && NATIVE_COUNT=$(wc -l < "$PKG_INSTALL_FILE")
+CLI_COUNT=0
+[[ -f "$BUNDLE/packages/cli-tools.txt" ]] && CLI_COUNT=$(wc -l < "$BUNDLE/packages/cli-tools.txt")
+# App counts (saved by newer bundles; absent in older ones)
+DESKTOP_APP_COUNT=$(get_manifest "desktop_app_count" "")
+CLI_APP_COUNT=$(get_manifest "cli_count" "")
+# Build a human-readable app summary for UI screens
+if [[ -n "$DESKTOP_APP_COUNT" && -n "$CLI_APP_COUNT" ]]; then
+    APP_SUMMARY="${DESKTOP_APP_COUNT} desktop + ${CLI_APP_COUNT} CLI apps"
+else
+    APP_SUMMARY="$NATIVE_COUNT packages"
+fi
 AUR_COUNT=0
 SRC_PKG_FOREIGN_FILE=$(get_manifest "pkg_foreign_file" "${SRC_PKG_MANAGER}-foreign.txt")
 [[ -f "$BUNDLE/packages/$SRC_PKG_FOREIGN_FILE" ]] && AUR_COUNT=$(wc -l < "$BUNDLE/packages/$SRC_PKG_FOREIGN_FILE")
@@ -2298,6 +2408,8 @@ NFS_FSTAB_FILE=""
 SOURCE_OS=$(grep "^# Source OS:" "$MANIFEST" 2>/dev/null | cut -d: -f2- | xargs || echo "unknown")
 SOURCE_HOST=$(grep "^# Source host:" "$MANIFEST" 2>/dev/null | cut -d: -f2- | xargs || echo "unknown")
 
+IMPORT_SUMMARY_FILE=""   # set by TUI save dialog or non-TUI auto-save below
+
 # ═════════════════════════════════════════════════════════════════════════════
 # TUI MODE (whiptail)
 # ═════════════════════════════════════════════════════════════════════════════
@@ -2322,7 +2434,7 @@ Bundle found and loaded.
   Bundle path:  $BUNDLE
 
 Contents:
-  • $NATIVE_COUNT ${SRC_PKG_MANAGER} packages  ($AUR_COUNT foreign/AUR)
+  • $APP_SUMMARY  ($AUR_COUNT foreign/AUR)
   • $FLATPAK_COUNT Flatpak apps
   • $APPIMAGE_COUNT AppImages (manual copy required)
   • Configs, dotfiles, ~/.local/share
@@ -2357,6 +2469,12 @@ fi
 if [[ "$FLATPAK_COUNT" -gt 0 ]]; then
     if command -v flatpak &>/dev/null; then
         PREFLIGHT_MSG+="✓  Flatpak is installed\n"
+        if flatpak remotes 2>/dev/null | grep -q "flathub"; then
+            PREFLIGHT_MSG+="✓  Flathub remote is configured\n"
+        else
+            PREFLIGHT_MSG+="□  ⚠ Flathub remote not found — add it first:\n"
+            PREFLIGHT_MSG+="      flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo\n"
+        fi
     else
         PREFLIGHT_MSG+="□  ⚠ Install Flatpak first:\n"
         case "$PKG_FAMILY" in
@@ -2419,10 +2537,10 @@ whiptail --title "Pre-flight Checklist" \
 # ── Screen 3: Confirm order of events ────────────────────────────────────────
 whiptail --title "Import — Order of Events" \
   --msgbox "\
-The import runs in this order to ensure apps exist
-before their configs are restored:
+The import runs in this order to ensure packages are
+installed before their configs are restored:
 
-  Stage 1 — Packages & apps
+  Stage 1 — Packages
     1a. Native packages (${PKG_MANAGER})
     1b. AUR / foreign packages
     1c. PPAs / external repos  (Ubuntu/Debian)
@@ -2472,11 +2590,10 @@ if [[ "$IMP_NO_PACKAGES" == false ]] && [[ -n "$PKG_INSTALL_FILE" ]]; then
     OLD_NOTE=""
     [[ "$PKG_INSTALL_OLD_FORMAT" == true ]] && OLD_NOTE="
 (Legacy bundle — using full package list. Some packages may not exist on this distro.)"
-    whiptail --title "Stage 1 of 2: Packages ($NATIVE_COUNT apps)" \
+    whiptail --title "Stage 1 of 2: Packages (${_DISTRO_LABEL})" \
       --yesno "\
-$NATIVE_COUNT apps from the source system.${CROSS_DISTRO_WARNING}${OLD_NOTE}
+$APP_SUMMARY to install via ${PKG_MANAGER}.${CROSS_DISTRO_WARNING}${OLD_NOTE}
 
-Will install using: ${PKG_MANAGER}
 Already-installed packages will be skipped.
 This may take a while depending on how many need downloading.
 
@@ -2530,12 +2647,15 @@ $(cat "$BUNDLE/packages/appimages.txt")
 Copy these files to wherever you keep them (e.g. ~/Applications/)
 and make them executable with: chmod +x *.AppImage" \
       $BOX_H $BOX_W
+    while read -r _ai; do
+        add_manual "Install AppImage manually: $_ai  →  chmod +x and move to ~/Applications/"
+    done < "$BUNDLE/packages/appimages.txt"
 fi
 
 # ── Confirm package install ───────────────────────────────────────────────────
 SUMMARY_LINES=""
-[[ "$INSTALL_NATIVE" == true ]] && SUMMARY_LINES+="  • $NATIVE_COUNT native pacman packages\n"
-[[ "${#SELECTED_AUR[@]}" -gt 0 ]] && SUMMARY_LINES+="  • ${#SELECTED_AUR[@]} AUR packages\n"
+[[ "$INSTALL_NATIVE" == true ]] && SUMMARY_LINES+="  • $APP_SUMMARY\n"
+[[ "${#SELECTED_AUR[@]}" -gt 0 && "$PKG_FAMILY" == "arch" ]] && SUMMARY_LINES+="  • ${#SELECTED_AUR[@]} AUR packages\n"
 [[ "${#SELECTED_FLATPAK[@]}" -gt 0 ]] && SUMMARY_LINES+="  • ${#SELECTED_FLATPAK[@]} Flatpak apps\n"
 [[ -z "$SUMMARY_LINES" ]] && SUMMARY_LINES="  • Nothing selected\n"
 
@@ -2618,9 +2738,26 @@ Add these PPAs now? (requires internet connection)" \
     if [[ "${#SELECTED_FLATPAK[@]}" -gt 0 ]]; then
         echo ""
         header "Installing Flatpak apps (${#SELECTED_FLATPAK[@]})..."
-        flatpak install --noninteractive "${SELECTED_FLATPAK[@]}" 2>&1 | tee -a "$IMPORT_LOG" || warn "Some Flatpak apps failed"
-        ok "Flatpak apps done"
+        # Build app→remote map from bundle's recorded origins
+        declare -A _FP_RMAP=()
+        [[ -f "$BUNDLE/packages/flatpak-full.txt" ]] && while IFS=$'\t' read -r _aid _n _v _ori; do
+            _FP_RMAP["$_aid"]="${_ori:-flathub}"
+        done < "$BUNDLE/packages/flatpak-full.txt"
+        # Group selected apps by their source remote and install each group
+        declare -A _FP_BREM=()
+        for _app in "${SELECTED_FLATPAK[@]}"; do
+            _rem="${_FP_RMAP[$_app]:-flathub}"
+            _FP_BREM["$_rem"]+=" $_app"
+        done
+        _FP_ALL_OK=true
+        for _rem in "${!_FP_BREM[@]}"; do
+            read -ra _apps <<< "${_FP_BREM[$_rem]}"
+            flatpak install --noninteractive --or-update "$_rem" "${_apps[@]}" 2>&1 | tee -a "$IMPORT_LOG" \
+                || { warn "Some Flatpak apps from $_rem failed"; _FP_ALL_OK=false; }
+        done
+        [[ "$_FP_ALL_OK" == true ]] && ok "Flatpak apps done" || warn "Some Flatpak apps may not have installed — check log above"
         info "  Log out and back in for Flatpak apps to appear in your launcher"
+        add_manual "Log out and back in (or reboot) for Flatpak apps to appear in your launcher"
     fi
 
     whiptail --title "✅ Packages Complete" \
@@ -2668,9 +2805,13 @@ Restore TurboPrint configuration now?"               $BOX_H $BOX_W && _DO_TP_RES
                 [[ -d "$BUNDLE/turboprint/ppd" ]]      && sudo cp "$BUNDLE/turboprint/ppd/"*.ppd /etc/cups/ppd/ 2>/dev/null || true
                 [[ -d "$BUNDLE/turboprint/profiles" ]] && sudo cp -r "$BUNDLE/turboprint/profiles/." /usr/share/turboprint/profiles/ 2>/dev/null || true
                 [[ -f "$BUNDLE/turboprint/user/dot-turboprint" ]] && cp "$BUNDLE/turboprint/user/dot-turboprint" "$HOME/.turboprint" 2>/dev/null || true
+                sudo tpsetup --restore 2>/dev/null \
+                    && ok "tpsetup --restore: print queues rebuilt" \
+                    || warn "tpsetup --restore failed — verify print queues in xtpsetup"
                 sudo systemctl restart cups 2>/dev/null || true
                 ok "TurboPrint restored"
                 log_import "RESTORED: TurboPrint"
+                add_manual "TurboPrint: if printer port is wrong, open xtpsetup → Edit → re-select port"
 
                 TPKEY_FOUND=$(find /etc/turboprint -name "*.tpkey" 2>/dev/null | head -1 || true)
                 whiptail --title "TurboPrint — License"                   --msgbox "TurboPrint config restored and CUPS restarted.
@@ -2682,6 +2823,9 @@ License key status:
 Verify printer queues:
   xtpsetup        (GUI)
   tpsetup --list  (command line)
+
+⚠️  If the printer port is wrong (common after migration):
+  Open xtpsetup → Edit → re-select the port from the list.
 
 If printouts show a watermark, the license needs re-applying."                   $BOX_H $BOX_W
             fi
@@ -2695,9 +2839,13 @@ If printouts show a watermark, the license needs re-applying."                  
                 [[ -d "$BUNDLE/turboprint/ppd" ]]      && sudo cp "$BUNDLE/turboprint/ppd/"*.ppd /etc/cups/ppd/ 2>/dev/null || true
                 [[ -d "$BUNDLE/turboprint/profiles" ]] && sudo cp -r "$BUNDLE/turboprint/profiles/." /usr/share/turboprint/profiles/ 2>/dev/null || true
                 [[ -f "$BUNDLE/turboprint/user/dot-turboprint" ]] && cp "$BUNDLE/turboprint/user/dot-turboprint" "$HOME/.turboprint" 2>/dev/null || true
+                sudo tpsetup --restore 2>/dev/null \
+                    && ok "tpsetup --restore: print queues rebuilt" \
+                    || warn "tpsetup --restore failed — verify print queues in xtpsetup"
                 sudo systemctl restart cups 2>/dev/null || true
                 ok "TurboPrint restored"
                 log_import "RESTORED: TurboPrint"
+                add_manual "TurboPrint: if printer port is wrong, open xtpsetup → Edit → re-select port"
             else
                 info "[DRY RUN] would restore TurboPrint"
             fi
@@ -2785,9 +2933,39 @@ fi
 if [[ "$RESTORE_GNOME" == true ]]; then
     step "GNOME extensions..."
     [[ -d "$BUNDLE/gnome/extensions-backup" ]] && do_copy "$BUNDLE/gnome/extensions-backup/." "$HOME/.local/share/gnome-shell/extensions"
-    step "dconf settings..."
+    # Enable extensions that were enabled on the source system
+    if [[ -f "$BUNDLE/gnome/gnome-extensions-enabled.txt" ]] && [[ -s "$BUNDLE/gnome/gnome-extensions-enabled.txt" ]]; then
+        if [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]] && command -v gnome-extensions &>/dev/null; then
+            _ext_ok=0
+            while read -r _uuid; do
+                [[ -z "$_uuid" ]] && continue
+                gnome-extensions enable "$_uuid" 2>/dev/null && _ext_ok=$((_ext_ok+1)) || true
+            done < "$BUNDLE/gnome/gnome-extensions-enabled.txt"
+            ok "Enabled $_ext_ok GNOME extensions"; log_import "RESTORED: GNOME extensions enabled ($_ext_ok)"
+        else
+            warn "Extensions installed but not enabled (no live GNOME session)"
+            warn "Enable them from the Extensions app, or run from a GNOME terminal:"
+            warn "  while read u; do gnome-extensions enable \"\$u\"; done < $BUNDLE/gnome/gnome-extensions-enabled.txt"
+            add_manual "Enable GNOME extensions (no session at import time) — run from GNOME terminal:"
+            add_manual "  while read u; do gnome-extensions enable \"\$u\"; done < $BUNDLE/gnome/gnome-extensions-enabled.txt"
+        fi
+    fi
+    step "dconf settings (GNOME Tweaks, keyboard shortcuts, all settings)..."
     if [[ -f "$BUNDLE/gnome/dconf-full.ini" ]] && command -v dconf &>/dev/null; then
-        dconf load / < "$BUNDLE/gnome/dconf-full.ini" && ok "dconf loaded" && log_import "RESTORED: dconf"
+        if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
+            warn "No active GNOME session detected — dconf settings NOT restored"
+            warn "Run this from a terminal inside your GNOME session:"
+            warn "  dconf load / < $BUNDLE/gnome/dconf-full.ini"
+            log_import "SKIPPED: dconf (no session bus — run manually from GNOME terminal)"
+            add_manual "Restore GNOME settings (keyboard shortcuts, Tweaks, etc.) — run from GNOME terminal:"
+            add_manual "  dconf load / < $BUNDLE/gnome/dconf-full.ini"
+        else
+            dconf load / < "$BUNDLE/gnome/dconf-full.ini" \
+                && ok "dconf loaded (GNOME Tweaks, keyboard shortcuts, all settings)" \
+                && log_import "RESTORED: dconf" \
+                || warn "dconf load failed — try: dconf load / < $BUNDLE/gnome/dconf-full.ini"
+            info "  Note: some settings take effect after logging out and back in"
+        fi
     fi
 fi
 
@@ -2821,22 +2999,35 @@ if [[ "$RESTORE_STEAM" == true ]]; then
 fi
 
 if [[ "$RESTORE_HOMEDIRS" == true ]]; then
-    step "XDG home directories..."
+    step "XDG home directories (this may take a while for large folders)..."
+    info "  Tip: keep this terminal active — system sleep will interrupt the copy"
     grep "^homedir:" "$MANIFEST" 2>/dev/null | while IFS=: read -r _ xdg orig_dir bundle_subdir; do
         BUNDLE_SRC="$BUNDLE/$bundle_subdir"
         DEST_PARENT=$(dirname "$orig_dir")
-        [[ -d "$BUNDLE_SRC" ]] && do_copy "$BUNDLE_SRC" "$DEST_PARENT" && ok "homedirs: $xdg (→ $orig_dir)" && log_import "RESTORED: homedir $xdg"
+        if [[ -d "$BUNDLE_SRC" ]]; then
+            _sz=$(du -sh "$BUNDLE_SRC" 2>/dev/null | awk '{print $1}' || echo "?")
+            info "  Copying $xdg ($_sz) → $orig_dir ..."
+            do_large_copy "$BUNDLE_SRC" "$DEST_PARENT" \
+                && ok "homedirs: $xdg (→ $orig_dir)" && log_import "RESTORED: homedir $xdg"
+        fi
     done
 fi
 
 if [[ "$RESTORE_USERHOMES" == true ]]; then
-    step "/home user directories..."
+    step "/home user directories (this may take a while)..."
+    info "  Tip: keep this terminal active — system sleep will interrupt the copy"
     grep "^userhome:" "$MANIFEST" 2>/dev/null | while IFS=: read -r _ name orig_dir bundle_subdir; do
         BUNDLE_SRC="$BUNDLE/$bundle_subdir"
         if [[ -d "$BUNDLE_SRC" ]]; then
-            [[ "$DRY_RUN" == true ]] && { info "[DRY RUN] would sudo cp -rn $BUNDLE_SRC/. $orig_dir"; continue; }
+            [[ "$DRY_RUN" == true ]] && { info "[DRY RUN] would sudo rsync/cp $BUNDLE_SRC → $orig_dir"; continue; }
+            _sz=$(du -sh "$BUNDLE_SRC" 2>/dev/null | awk '{print $1}' || echo "?")
+            info "  Copying /home/$name ($_sz) → $orig_dir ..."
             sudo mkdir -p "$orig_dir"
-            sudo cp -rn "$BUNDLE_SRC/." "$orig_dir/" 2>/dev/null || warn "Some files may not have copied for $name"
+            if command -v rsync &>/dev/null; then
+                sudo rsync -a --ignore-existing --info=progress2 "$BUNDLE_SRC/" "$orig_dir/" 2>&1 || warn "Some files may not have copied for $name"
+            else
+                sudo cp -rn "$BUNDLE_SRC/." "$orig_dir/" 2>/dev/null || warn "Some files may not have copied for $name"
+            fi
             ok "/home/$name restored"; log_import "RESTORED: /home/$name"
         fi
     done
@@ -2977,26 +3168,38 @@ if [[ "$NFS_MNT" == "true" ]] || [[ "$NFS_EXP" == "true" ]]; then
     [[ -n "$NFS_MSG" ]] && whiptail --title "NFS" --msgbox "$NFS_MSG" $BOX_H $BOX_W
 fi
 
+# ── Save import summary ───────────────────────────────────────────────────────
+SUMMARY_FILENAME="distro-plopper-summary-${TIMESTAMP}.txt"
+_SUMMARY_CHOICE=$(whiptail --title "Save Import Summary" \
+  --menu "Where would you like to save the import summary?" \
+  12 $BOX_W 4 \
+  "desktop"   "Desktop          ($HOME/Desktop/)" \
+  "downloads" "Downloads        ($HOME/Downloads/)" \
+  "bundle"    "Bundle folder    ($(dirname "$BUNDLE_PATH"))" \
+  "none"      "Don't save" \
+  3>&1 1>&2 2>&3) || true
+
+case "${_SUMMARY_CHOICE:-bundle}" in
+    desktop)   IMPORT_SUMMARY_FILE="$HOME/Desktop/$SUMMARY_FILENAME" ;;
+    downloads) IMPORT_SUMMARY_FILE="$HOME/Downloads/$SUMMARY_FILENAME" ;;
+    bundle)    IMPORT_SUMMARY_FILE="$(dirname "$BUNDLE_PATH")/$SUMMARY_FILENAME" ;;
+    none)      IMPORT_SUMMARY_FILE="" ;;
+esac
+[[ -n "$IMPORT_SUMMARY_FILE" ]] && write_import_summary "$IMPORT_SUMMARY_FILE" \
+    && ok "Summary saved: $IMPORT_SUMMARY_FILE"
+
 # ── Final summary ─────────────────────────────────────────────────────────────
 whiptail --title "✅ Import Complete!" \
   --msgbox "\
 Everything selected has been restored.
-
-Remaining manual steps:
-  • Copy SSH private keys: ~/.ssh/id_*
-    then run: chmod 600 ~/.ssh/id_*
-  • tailscale up  (re-authenticate)
-  • Re-pair Syncthing devices
-  • Verify GPU drivers are loaded
-  • Enable GNOME extensions via the Extensions app
-    (Settings → Extensions — they are installed but off by default)
-  • Reboot  ← do this last; required for services to start correctly
-
-Import log saved to:
-  $IMPORT_LOG
-
-Check the log for any errors or skipped items." \
-  $BOX_H $BOX_W
+Check the summary file for details, warnings, and manual steps.
+${IMPORT_SUMMARY_FILE:+
+Summary saved to:
+  $IMPORT_SUMMARY_FILE
+}
+Full log saved to:
+  $IMPORT_LOG" \
+  $BOX_H $BOX_W || true
 
 # ═════════════════════════════════════════════════════════════════════════════
 # FALLBACK: non-TUI (--dry-run or whiptail not available)
@@ -3010,8 +3213,8 @@ echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━�
 echo ""
 [[ -f "$MANIFEST" ]] && grep "^# " "$MANIFEST" | sed 's/^# /  /' || echo "  (no manifest)"
 echo ""
-printf "  %-30s %s\n" "Native packages:"   "$NATIVE_COUNT"
-printf "  %-30s %s\n" "Foreign packages:"  "$AUR_COUNT  (${SRC_PKG_MANAGER} → ${PKG_MANAGER})"
+printf "  %-30s %s\n" "${_DISTRO_LABEL} apps:"          "$APP_SUMMARY"
+[[ "$AUR_COUNT" -gt 0 ]] && printf "  %-30s %s\n" "Foreign/AUR packages:" "$AUR_COUNT  (${SRC_PKG_MANAGER} → ${PKG_MANAGER})"
 printf "  %-30s %s\n" "Flatpak apps:"      "$FLATPAK_COUNT"
 printf "  %-30s %s\n" "AppImages:"         "$APPIMAGE_COUNT (manual)"
 [[ "$DRY_RUN" == true ]] && echo -e "\n  ${YELLOW}DRY RUN — nothing will be written${RESET}"
@@ -3084,10 +3287,28 @@ if [[ "$IMP_NO_PACKAGES" == false ]]; then
     if [[ -f "$BUNDLE/packages/flatpak-apps.txt" ]] && [[ "$FLATPAK_COUNT" -gt 0 ]]; then
         step "Flatpak apps ($FLATPAK_COUNT)..."
         if command -v flatpak &>/dev/null; then
-            [[ "$DRY_RUN" == false ]] \
-                && flatpak install --noninteractive $(cat "$BUNDLE/packages/flatpak-apps.txt") 2>&1 | tee -a "$IMPORT_LOG" \
-                && info "  Log out and back in for Flatpak apps to appear in your launcher" \
-                || info "[DRY RUN] flatpak install $FLATPAK_COUNT apps"
+            if [[ "$DRY_RUN" == false ]]; then
+                # Build app→remote map then install each remote's apps as a group
+                declare -A _FP_RMAP=()
+                [[ -f "$BUNDLE/packages/flatpak-full.txt" ]] && while IFS=$'\t' read -r _aid _n _v _ori; do
+                    _FP_RMAP["$_aid"]="${_ori:-flathub}"
+                done < "$BUNDLE/packages/flatpak-full.txt"
+                declare -A _FP_BREM=()
+                while read -r _app; do
+                    [[ -z "$_app" ]] && continue
+                    _rem="${_FP_RMAP[$_app]:-flathub}"
+                    _FP_BREM["$_rem"]+=" $_app"
+                done < "$BUNDLE/packages/flatpak-apps.txt"
+                for _rem in "${!_FP_BREM[@]}"; do
+                    read -ra _apps <<< "${_FP_BREM[$_rem]}"
+                    flatpak install --noninteractive --or-update "$_rem" "${_apps[@]}" 2>&1 | tee -a "$IMPORT_LOG" \
+                        || warn "Some Flatpak apps from $_rem failed"
+                done
+                info "  Log out and back in for Flatpak apps to appear in your launcher"
+                add_manual "Log out and back in (or reboot) for Flatpak apps to appear in your launcher"
+            else
+                info "[DRY RUN] flatpak install $FLATPAK_COUNT apps"
+            fi
         else
             warn "Flatpak not installed — skipping"
         fi
@@ -3096,6 +3317,9 @@ if [[ "$IMP_NO_PACKAGES" == false ]]; then
     if [[ "$APPIMAGE_COUNT" -gt 0 ]]; then
         warn "AppImages ($APPIMAGE_COUNT) require manual install:"
         cat "$BUNDLE/packages/appimages.txt"
+        while read -r _ai; do
+            add_manual "Install AppImage manually: $_ai  →  chmod +x and move to ~/Applications/"
+        done < "$BUNDLE/packages/appimages.txt"
     fi
 fi
 
@@ -3118,7 +3342,38 @@ fi
 if [[ "$IMP_NO_GNOME" == false && "$HAS_GNOME" == true ]]; then
     step "GNOME..."
     [[ -d "$BUNDLE/gnome/extensions-backup" ]] && do_copy "$BUNDLE/gnome/extensions-backup/." "$HOME/.local/share/gnome-shell/extensions"
-    [[ -f "$BUNDLE/gnome/dconf-full.ini" ]] && command -v dconf &>/dev/null && [[ "$DRY_RUN" == false ]] && dconf load / < "$BUNDLE/gnome/dconf-full.ini" && ok "dconf loaded" && log_import "RESTORED: dconf"
+    # Enable extensions that were enabled on the source system
+    if [[ -f "$BUNDLE/gnome/gnome-extensions-enabled.txt" ]] && [[ -s "$BUNDLE/gnome/gnome-extensions-enabled.txt" ]] && [[ "$DRY_RUN" == false ]]; then
+        if [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]] && command -v gnome-extensions &>/dev/null; then
+            _ext_ok=0
+            while read -r _uuid; do
+                [[ -z "$_uuid" ]] && continue
+                gnome-extensions enable "$_uuid" 2>/dev/null && _ext_ok=$((_ext_ok+1)) || true
+            done < "$BUNDLE/gnome/gnome-extensions-enabled.txt"
+            ok "Enabled $_ext_ok GNOME extensions"; log_import "RESTORED: GNOME extensions enabled ($_ext_ok)"
+        else
+            warn "Extensions installed but not enabled (no live GNOME session)"
+            warn "Run from a GNOME terminal to enable them:"
+            warn "  while read u; do gnome-extensions enable \"\$u\"; done < $BUNDLE/gnome/gnome-extensions-enabled.txt"
+            add_manual "Enable GNOME extensions (no session at import time) — run from GNOME terminal:"
+            add_manual "  while read u; do gnome-extensions enable \"\$u\"; done < $BUNDLE/gnome/gnome-extensions-enabled.txt"
+        fi
+    fi
+    if [[ -f "$BUNDLE/gnome/dconf-full.ini" ]] && command -v dconf &>/dev/null && [[ "$DRY_RUN" == false ]]; then
+        if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
+            warn "No active GNOME session — dconf NOT restored. Run from a GNOME terminal:"
+            warn "  dconf load / < $BUNDLE/gnome/dconf-full.ini"
+            log_import "SKIPPED: dconf (no session bus)"
+            add_manual "Restore GNOME settings (keyboard shortcuts, Tweaks, etc.) — run from GNOME terminal:"
+            add_manual "  dconf load / < $BUNDLE/gnome/dconf-full.ini"
+        else
+            dconf load / < "$BUNDLE/gnome/dconf-full.ini" \
+                && ok "dconf loaded (GNOME Tweaks, keyboard shortcuts, all settings)" \
+                && log_import "RESTORED: dconf" \
+                || warn "dconf load failed"
+            info "  Note: some settings take effect after logging out and back in"
+        fi
+    fi
 fi
 
 if [[ "$IMP_NO_SSH" == false && "$HAS_SSH" == true ]]; then
@@ -3153,22 +3408,35 @@ if [[ "$IMP_NO_STEAM" == false && "$HAS_STEAM" == true ]]; then
 fi
 
 if [[ "$IMP_NO_HOMEDIRS" == false && "$HAS_HOMEDIRS" == true ]]; then
-    step "XDG home directories..."
+    step "XDG home directories (this may take a while for large folders)..."
+    info "  Tip: keep this terminal active — system sleep will interrupt the copy"
     grep "^homedir:" "$MANIFEST" 2>/dev/null | while IFS=: read -r _ xdg orig_dir bundle_subdir; do
         BUNDLE_SRC="$BUNDLE/$bundle_subdir"
         DEST_PARENT=$(dirname "$orig_dir")
-        [[ -d "$BUNDLE_SRC" ]] && do_copy "$BUNDLE_SRC" "$DEST_PARENT" && ok "homedirs: $xdg" && log_import "RESTORED: homedir $xdg"
+        if [[ -d "$BUNDLE_SRC" ]]; then
+            _sz=$(du -sh "$BUNDLE_SRC" 2>/dev/null | awk '{print $1}' || echo "?")
+            info "  Copying $xdg ($_sz) → $orig_dir ..."
+            do_large_copy "$BUNDLE_SRC" "$DEST_PARENT" \
+                && ok "homedirs: $xdg" && log_import "RESTORED: homedir $xdg"
+        fi
     done
 fi
 
 if [[ "$IMP_NO_USERHOMES" == false && "$HAS_USERHOMES" == true ]]; then
-    step "/home user directories..."
+    step "/home user directories (this may take a while)..."
+    info "  Tip: keep this terminal active — system sleep will interrupt the copy"
     grep "^userhome:" "$MANIFEST" 2>/dev/null | while IFS=: read -r _ name orig_dir bundle_subdir; do
         BUNDLE_SRC="$BUNDLE/$bundle_subdir"
         if [[ -d "$BUNDLE_SRC" ]]; then
-            [[ "$DRY_RUN" == true ]] && { info "[DRY RUN] would sudo cp -rn $BUNDLE_SRC/. $orig_dir"; continue; }
+            [[ "$DRY_RUN" == true ]] && { info "[DRY RUN] would sudo rsync/cp $BUNDLE_SRC → $orig_dir"; continue; }
+            _sz=$(du -sh "$BUNDLE_SRC" 2>/dev/null | awk '{print $1}' || echo "?")
+            info "  Copying /home/$name ($_sz) → $orig_dir ..."
             sudo mkdir -p "$orig_dir"
-            sudo cp -rn "$BUNDLE_SRC/." "$orig_dir/" 2>/dev/null || warn "Some files may not have copied for $name"
+            if command -v rsync &>/dev/null; then
+                sudo rsync -a --ignore-existing --info=progress2 "$BUNDLE_SRC/" "$orig_dir/" 2>&1 || warn "Some files may not have copied for $name"
+            else
+                sudo cp -rn "$BUNDLE_SRC/." "$orig_dir/" 2>/dev/null || warn "Some files may not have copied for $name"
+            fi
             ok "/home/$name restored"; log_import "RESTORED: /home/$name"
         fi
     done
@@ -3231,6 +3499,14 @@ fi
 
 fi # end TUI/fallback
 
+# ── Non-TUI: auto-save summary to bundle folder ───────────────────────────────
+if [[ "$USE_TUI" != true ]] && [[ "$DRY_RUN" == false ]]; then
+    SUMMARY_FILENAME="distro-plopper-summary-${TIMESTAMP}.txt"
+    IMPORT_SUMMARY_FILE="$(dirname "$BUNDLE_PATH")/$SUMMARY_FILENAME"
+    write_import_summary "$IMPORT_SUMMARY_FILE" \
+        && ok "Import summary saved: $IMPORT_SUMMARY_FILE"
+fi
+
 # ── Final output (both modes) ─────────────────────────────────────────────────
 echo ""
 echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
@@ -3239,7 +3515,8 @@ echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━�
     || echo -e "${GREEN}${BOLD}  Import complete!${RESET}"
 echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
 echo ""
-[[ "$DRY_RUN" == false ]] && echo "  Import log: $IMPORT_LOG"
+[[ "$DRY_RUN" == false ]] && echo "  Import log:     $IMPORT_LOG"
+[[ "$DRY_RUN" == false && -n "${IMPORT_SUMMARY_FILE:-}" ]] && echo "  Import summary: $IMPORT_SUMMARY_FILE"
 echo ""
 echo -e "  ${YELLOW}Manual steps remaining:${RESET}"
 echo "    • Copy SSH private keys and chmod 600 ~/.ssh/id_*"
@@ -3248,6 +3525,14 @@ echo "    • tailscale up"
 echo "    • Re-pair Syncthing devices"
 echo "    • Enable GNOME extensions via Extensions app"
 echo "      (Settings → Extensions — they are installed but off by default)"
+echo "    • If GNOME keyboard shortcuts / settings were not restored, run from"
+echo "      a terminal inside GNOME:  dconf load / < $BUNDLE/gnome/dconf-full.ini"
+echo "    • AppImage configs: ~/.config is restored with no-overwrite mode."
+echo "      If an app was already launched on this system (creating a default config),"
+echo "      its old settings were skipped. To force-restore a specific app:"
+echo "        cp -rf $BUNDLE/configs/config-dirs/<AppName> ~/.config/"
+echo "      Some AppImages use a portable config folder next to the .AppImage file"
+echo "      — those are NOT captured and must be copied manually."
 echo "    • Verify GPU drivers"
 echo "    • Reboot  ← required for services to start correctly"
 echo ""

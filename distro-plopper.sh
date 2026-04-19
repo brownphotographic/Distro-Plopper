@@ -500,6 +500,26 @@ find "$HOME" /opt /usr/local/bin /usr/local/lib 2>/dev/null \
 SCAN_RESULTS[appimage_count]=$(wc -l < "$SCAN_TMP/appimages.txt")
 ok "AppImages: ${SCAN_RESULTS[appimage_count]} found"
 
+# Detect portable-mode config dirs adjacent to each AppImage
+# Some AppImages store config next to the .AppImage file rather than in ~/.config
+> "$SCAN_TMP/appimage-portable.txt"
+while IFS= read -r _ai; do
+    _ai_dir=$(dirname "$_ai")
+    _ai_base=$(basename "$_ai")
+    _ai_name="${_ai_base%.*}"
+    for _pd in \
+        "$_ai_dir/.config" \
+        "$_ai_dir/${_ai_base}.config" \
+        "$_ai_dir/${_ai_name}.config" \
+        "$_ai_dir/${_ai_base}.home" \
+        "$_ai_dir/${_ai_name}.home"; do
+        [[ -d "$_pd" ]] && echo "$_ai|$_pd" >> "$SCAN_TMP/appimage-portable.txt" || true
+    done
+done < "$SCAN_TMP/appimages.txt"
+SCAN_RESULTS[appimage_portable]=$(wc -l < "$SCAN_TMP/appimage-portable.txt")
+[[ "${SCAN_RESULTS[appimage_portable]:-0}" -gt 0 ]] \
+    && ok "AppImage portable configs: ${SCAN_RESULTS[appimage_portable]} dir(s) found" || true
+
 # S4. ~/.config full scan
 info "Scanning ~/.config (full)..."
 find "$HOME/.config" -mindepth 1 -maxdepth 1 -type d | sort > "$SCAN_TMP/config-dirs.txt"
@@ -513,6 +533,18 @@ info "Scanning ~/.local/share..."
 find "$HOME/.local/share" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort > "$SCAN_TMP/local-share-dirs.txt"
 SCAN_RESULTS[local_share_size]=$(du -sh "$HOME/.local/share" 2>/dev/null | tail -1 | awk '{print $1}' | grep -v '^$' || echo '?')
 ok "~/.local/share: $(wc -l < "$SCAN_TMP/local-share-dirs.txt") dirs, size: ${SCAN_RESULTS[local_share_size]}"
+
+# S5b. ~/.local/state (XDG state dir — app state, shell history, undo data)
+find "$HOME/.local/state" -mindepth 1 -maxdepth 1 2>/dev/null | sort > "$SCAN_TMP/local-state-dirs.txt" || true
+SCAN_RESULTS[local_state_size]=$(du -sh "$HOME/.local/state" 2>/dev/null | awk '{print $1}' || echo "0")
+ok "~/.local/state: $(wc -l < "$SCAN_TMP/local-state-dirs.txt") entries, size: ${SCAN_RESULTS[local_state_size]}"
+
+# S5c. ~/.local/bin (user scripts and pip/pipx binaries)
+SCAN_RESULTS[local_bin_count]=0
+if [[ -d "$HOME/.local/bin" ]]; then
+    SCAN_RESULTS[local_bin_count]=$(find "$HOME/.local/bin" -maxdepth 1 -type f 2>/dev/null | wc -l || echo 0)
+    ok "~/.local/bin: ${SCAN_RESULTS[local_bin_count]} file(s)"
+fi
 
 # S6. Home dotfiles
 info "Scanning home dotfiles..."
@@ -1529,7 +1561,7 @@ copy_with_spinner() {
 # PHASE 2: CREATE OUTPUT STRUCTURE
 # =============================================================================
 header "PHASE 2: Creating output structure..."
-mkdir -p "$OUTPUT_DIR"/{packages,configs/{dotfiles,config-dirs,local-share},flatpak,browsers,gnome/extensions-backup,nfs,ssh,fonts,systemd,docker,hardware,steam,homedirs,user-homes,scripts}
+mkdir -p "$OUTPUT_DIR"/{packages,configs/{dotfiles,config-dirs,local-share,local-state,local-bin},flatpak,browsers,gnome/extensions-backup,nfs,ssh,fonts,systemd,docker,hardware,steam,homedirs,user-homes,scripts}
 
 MD="$OUTPUT_DIR/MIGRATION_REPORT.md"
 
@@ -1572,6 +1604,17 @@ cp "$SCAN_TMP/apps.txt"      "$OUTPUT_DIR/packages/" 2>/dev/null || true
 cp "$SCAN_TMP/cli-tools.txt" "$OUTPUT_DIR/packages/" 2>/dev/null || true
 cp "$SCAN_TMP"/flatpak-*.txt "$OUTPUT_DIR/packages/" 2>/dev/null || true
 cp "$SCAN_TMP/appimages.txt"  "$OUTPUT_DIR/packages/" 2>/dev/null || true
+if [[ -s "$SCAN_TMP/appimage-portable.txt" ]]; then
+    mkdir -p "$OUTPUT_DIR/packages/appimage-portable"
+    > "$OUTPUT_DIR/packages/appimage-portable-manifest.txt"
+    while IFS="|" read -r _ai _pd; do
+        _slot=$(printf '%s___%s' "$_ai" "$(basename "$_pd")" | tr '/' '_' | tr ' ' '_')
+        mkdir -p "$OUTPUT_DIR/packages/appimage-portable/$_slot"
+        cp -r "$_pd/." "$OUTPUT_DIR/packages/appimage-portable/$_slot/" 2>/dev/null || true
+        echo "$_ai|$_pd|$_slot" >> "$OUTPUT_DIR/packages/appimage-portable-manifest.txt"
+    done < "$SCAN_TMP/appimage-portable.txt"
+    ok "AppImage portable configs copied (${SCAN_RESULTS[appimage_portable]} dir(s))"
+fi
 cp "$SCAN_TMP/pip-user.txt" "$SCAN_TMP/pipx.txt" "$SCAN_TMP/npm-global.txt" "$OUTPUT_DIR/packages/" 2>/dev/null || true
 echo "packages_present=true"                        >> "$MANIFEST"
 echo "pkg_manager=$PKG_MANAGER"                     >> "$MANIFEST"
@@ -1648,8 +1691,33 @@ while read -r dir; do
         log_md "| \`$NAME\` | $SIZE | ✅ |"
     fi
 done < "$SCAN_TMP/local-share-dirs.txt"
+# Shotwell thumbnail cache is large and regenerated automatically — strip it from the bundle
+if [[ -d "$OUTPUT_DIR/configs/local-share/shotwell/thumbs" ]]; then
+    rm -rf "$OUTPUT_DIR/configs/local-share/shotwell/thumbs"
+    ok "Shotwell thumbnail cache excluded (regenerated on first launch)"
+fi
 echo "local_share_present=true" >> "$MANIFEST"
 ok "~/.local/share copied (Steam game files excluded)"
+
+# ── ~/.local/state ────────────────────────────────────────────────────────────
+if [[ -d "$HOME/.local/state" ]] && [[ -n "$(ls "$HOME/.local/state" 2>/dev/null)" ]]; then
+    section_md "4b. ~/.local/state"
+    note_md "XDG state directory — app state, shell history, undo data, session info."
+    find "$HOME/.local/state" -mindepth 1 -maxdepth 1 2>/dev/null | while read -r item; do
+        cp -r "$item" "$OUTPUT_DIR/configs/local-state/" 2>/dev/null || true
+    done
+    echo "local_state_present=true" >> "$MANIFEST"
+    ok "~/.local/state copied (${SCAN_RESULTS[local_state_size]:-?})"
+fi
+
+# ── ~/.local/bin ──────────────────────────────────────────────────────────────
+if [[ -d "$HOME/.local/bin" ]] && [[ "${SCAN_RESULTS[local_bin_count]:-0}" -gt 0 ]]; then
+    section_md "4c. ~/.local/bin"
+    note_md "User scripts and pip/pipx-installed executables."
+    cp -r "$HOME/.local/bin/." "$OUTPUT_DIR/configs/local-bin/" 2>/dev/null || true
+    echo "local_bin_present=true" >> "$MANIFEST"
+    ok "~/.local/bin copied (${SCAN_RESULTS[local_bin_count]:-0} file(s))"
+fi
 fi # EXP_LOCALSHARE
 
 # ── Steam config ──────────────────────────────────────────────────────────────
@@ -2326,7 +2394,10 @@ do_copy() {
     local src="$1" dest="$2" mode="${3:-}"
     [[ "$DRY_RUN" == true ]] && { info "[DRY RUN] would copy: $src → $dest"; return; }
     mkdir -p "$dest"
-    [[ "$mode" == "--file" ]] && cp -n "$src" "$dest" 2>/dev/null || cp -rn "$src" "$dest" 2>/dev/null || true
+    if   [[ "$mode" == "--file"  ]]; then cp -n  "$src" "$dest" 2>/dev/null || true
+    elif [[ "$mode" == "--force" ]]; then cp -r  "$src" "$dest" 2>/dev/null || true
+    else                                  cp -rn "$src" "$dest" 2>/dev/null || true
+    fi
 }
 
 # Like do_copy but for large directories: shows progress and prevents system sleep
@@ -2390,6 +2461,8 @@ APPIMAGE_COUNT=0;[[ -f "$BUNDLE/packages/appimages.txt"     ]] && APPIMAGE_COUNT
 HAS_CONFIGS=$( [[ -d "$BUNDLE/configs/config-dirs" ]] && echo true || echo false)
 HAS_DOTFILES=$([[ -d "$BUNDLE/configs/dotfiles"    ]] && echo true || echo false)
 HAS_LOCAL=$(   [[ -d "$BUNDLE/configs/local-share" ]] && echo true || echo false)
+HAS_STATE=$(   [[ -d "$BUNDLE/configs/local-state" ]] && [[ -n "$(ls "$BUNDLE/configs/local-state/" 2>/dev/null)" ]] && echo true || echo false)
+HAS_BIN=$(     [[ -d "$BUNDLE/configs/local-bin"   ]] && [[ -n "$(ls "$BUNDLE/configs/local-bin/"   2>/dev/null)" ]] && echo true || echo false)
 HAS_FLATPAK=$( [[ -d "$BUNDLE/flatpak/var-app"    ]] && echo true || echo false)
 HAS_BROWSERS=$([[ -d "$BUNDLE/browsers"            ]] && echo true || echo false)
 HAS_GNOME=$(   [[ -f "$BUNDLE/gnome/dconf-full.ini" ]] && echo true || echo false)
@@ -2443,7 +2516,7 @@ Contents:
   • NFS mounts: $NFS_IN_BUNDLE
 
 Press OK to review the pre-flight checklist." \
-  $BOX_H $BOX_W
+  $BOX_H $BOX_W || true
 
 # ── Screen 2: Pre-flight checklist ───────────────────────────────────────────
 # Build checklist dynamically based on what's in the bundle
@@ -2532,7 +2605,7 @@ PREFLIGHT_MSG+="□  Reboot (required — services won't pick up until restart)\
 
 whiptail --title "Pre-flight Checklist" \
   --msgbox "$PREFLIGHT_MSG" \
-  $BOX_H $BOX_W
+  $BOX_H $BOX_W || true
 
 # ── Screen 3: Confirm order of events ────────────────────────────────────────
 whiptail --title "Import — Order of Events" \
@@ -2567,7 +2640,27 @@ installed before their configs are restored:
     3b. Summary & remaining manual steps
 
 Press OK to begin." \
-  $BOX_H $BOX_W
+  $BOX_H $BOX_W || true
+
+# ── Screen 4: High-level import scope ─────────────────────────────────────────
+_IMPORT_SCOPE=$(whiptail --title "Import — What to Restore" \
+  --menu "What would you like to import?" \
+  16 $BOX_W 4 \
+  "full"     "Full migration — packages + configs + data (step-by-step)" \
+  "configs"  "App configs only — ~/.config, dotfiles, ~/.local" \
+  "data"     "User data only — browsers, Flatpak, GNOME, SSH, fonts, Steam, home dirs" \
+  "packages" "Packages only — skip config/data restore" \
+  3>&1 1>&2 2>&3) || true
+[[ -z "$_IMPORT_SCOPE" ]] && _IMPORT_SCOPE="full"
+
+_SKIP_PACKAGES=false
+_SKIP_CONFIGS=false
+if   [[ "$_IMPORT_SCOPE" == "configs"  ]]; then _SKIP_PACKAGES=true
+elif [[ "$_IMPORT_SCOPE" == "data"     ]]; then _SKIP_PACKAGES=true
+elif [[ "$_IMPORT_SCOPE" == "packages" ]]; then _SKIP_CONFIGS=true
+fi
+
+if [[ "$_SKIP_PACKAGES" == false ]]; then
 
 # ═══════════════════════════════════════════════════════
 # STAGE 1: PACKAGES
@@ -2650,6 +2743,35 @@ and make them executable with: chmod +x *.AppImage" \
     while read -r _ai; do
         add_manual "Install AppImage manually: $_ai  →  chmod +x and move to ~/Applications/"
     done < "$BUNDLE/packages/appimages.txt"
+fi
+
+# ── AppImage portable configs ─────────────────────────────────────────────────
+if [[ -f "$BUNDLE/packages/appimage-portable-manifest.txt" ]]; then
+    _portable_manual=()
+    while IFS="|" read -r _ai _pd _slot; do
+        if [[ -d "$(dirname "$_ai")" ]] && [[ "$DRY_RUN" == false ]]; then
+            mkdir -p "$_pd"
+            cp -r "$BUNDLE/packages/appimage-portable/$_slot/." "$_pd/" 2>/dev/null || true
+            ok "AppImage portable config restored: $_pd"
+            log_import "RESTORED: AppImage portable config: $_pd"
+        else
+            _portable_manual+=("$_pd")
+            add_manual "AppImage portable config — copy manually after placing AppImage: cp -r \"$BUNDLE/packages/appimage-portable/$_slot/.\" \"$_pd/\""
+            [[ "$DRY_RUN" == true ]] && info "[DRY RUN] would restore portable config: $_pd"
+        fi
+    done < "$BUNDLE/packages/appimage-portable-manifest.txt"
+    if [[ ${#_portable_manual[@]} -gt 0 ]]; then
+        _pm_list=$(printf '  %s\n' "${_portable_manual[@]}")
+        whiptail --title "AppImage Portable Configs — Manual Step" \
+          --msgbox "Some AppImage portable configs could not be auto-restored
+because the AppImage hasn't been copied to its destination yet.
+
+After copying your AppImages, restore these manually:
+$_pm_list
+
+See the import summary for the exact copy commands." \
+          $BOX_H $BOX_W || true
+    fi
 fi
 
 # ── Confirm package install ───────────────────────────────────────────────────
@@ -2765,7 +2887,7 @@ Add these PPAs now? (requires internet connection)" \
 Check the terminal output above for any errors.
 
 Now moving to Stage 2: Restore configs and data." \
-      12 $BOX_W
+      12 $BOX_W || true
 fi
 
 # ═══════════════════════════════════════════════════════
@@ -2787,7 +2909,7 @@ To install TurboPrint:
   2. sudo ./setup  (TGZ)  or  sudo dpkg -i *.deb  (DEB)
   3. Re-run: bash distro-plopper.sh --import --bundle $BUNDLE
 
-The bundle will still be here when you come back."               $BOX_H $BOX_W
+The bundle will still be here when you come back."               $BOX_H $BOX_W || true
         else
             whiptail --title "TurboPrint — Restore Config"               --yesno "TurboPrint is installed and config is in the bundle.
 
@@ -2827,7 +2949,7 @@ Verify printer queues:
 ⚠️  If the printer port is wrong (common after migration):
   Open xtpsetup → Edit → re-select the port from the list.
 
-If printouts show a watermark, the license needs re-applying."                   $BOX_H $BOX_W
+If printouts show a watermark, the license needs re-applying."                   $BOX_H $BOX_W || true
             fi
         fi
     else
@@ -2856,65 +2978,130 @@ If printouts show a watermark, the license needs re-applying."                  
     fi
 fi
 
+fi # _SKIP_PACKAGES
+
+if [[ "$_SKIP_CONFIGS" == false ]]; then
+
 # ═══════════════════════════════════════════════════════
 # STAGE 2: CONFIGS & DATA
 # ═══════════════════════════════════════════════════════
 
-# Build checklist from what's actually in the bundle
-CONFIG_OPTS=()
-[[ "$HAS_CONFIGS"  == true ]] && CONFIG_OPTS+=("configs"   "~/.config app directories ($(du -sh "$BUNDLE/configs/config-dirs" 2>/dev/null | awk '{print $1}'))" "ON")
-[[ "$HAS_DOTFILES" == true ]] && CONFIG_OPTS+=("dotfiles"  "Home dotfiles (.bashrc, .zshrc, .gitconfig etc.)" "ON")
-[[ "$HAS_LOCAL"    == true ]] && CONFIG_OPTS+=("localshare" "~/.local/share app data ($(du -sh "$BUNDLE/configs/local-share" 2>/dev/null | awk '{print $1}'))" "ON")
-[[ "$HAS_FLATPAK"  == true ]] && CONFIG_OPTS+=("flatpakdata" "Flatpak app data ~/.var/app ($(du -sh "$BUNDLE/flatpak/var-app" 2>/dev/null | awk '{print $1}'))" "ON")
-[[ "$HAS_BROWSERS" == true ]] && CONFIG_OPTS+=("browsers"  "Browser profiles ($(du -sh "$BUNDLE/browsers" 2>/dev/null | awk '{print $1}'))" "ON")
-[[ "$HAS_GNOME"    == true ]] && CONFIG_OPTS+=("gnome"     "GNOME settings (dconf + extensions)" "ON")
-[[ "$HAS_SSH"      == true ]] && CONFIG_OPTS+=("ssh"       "SSH config & known_hosts (keys NOT copied)" "ON")
-[[ "$HAS_FONTS"    == true ]] && CONFIG_OPTS+=("fonts"     "User fonts ($(du -sh "$BUNDLE/fonts" 2>/dev/null | awk '{print $1}'))" "ON")
-[[ "$HAS_STEAM"    == true ]] && CONFIG_OPTS+=("steam"     "Steam config & userdata (no game files)" "ON")
-[[ "$HAS_HOMEDIRS"   == true ]] && CONFIG_OPTS+=("homedirs"   "XDG home dirs — Documents, Downloads, Pictures etc. ($(du -sh "$BUNDLE/homedirs" 2>/dev/null | awk '{print $1}'))" "ON")
-[[ "$HAS_USERHOMES"  == true ]] && CONFIG_OPTS+=("userhomes"  "/home user directories ($(du -sh "$BUNDLE/user-homes" 2>/dev/null | awk '{print $1}')) — requires sudo" "ON")
+# Initialise all restore flags to false
+RESTORE_CONFIGS=false; RESTORE_DOTFILES=false; RESTORE_LOCAL=false
+RESTORE_FLATPAK=false; RESTORE_BROWSERS=false; RESTORE_GNOME=false
+RESTORE_SSH=false;     RESTORE_FONTS=false;    RESTORE_STEAM=false
+RESTORE_HOMEDIRS=false; RESTORE_USERHOMES=false
 
-RESTORE_CHOICES=""
-if [[ "${#CONFIG_OPTS[@]}" -gt 0 ]]; then
-    RESTORE_CHOICES=$(whiptail --title "Stage 2 of 2: Select What to Restore" \
-      --checklist \
-"Everything is pre-selected. Uncheck anything you want to skip.
-Configs are copied with no-overwrite — existing files are kept.
-Space = toggle  |  Tab = move to OK/Cancel  |  Enter = confirm  |  Esc = cancel" \
-      $BOX_H $BOX_W $(( BOX_H - 10 )) \
-      "${CONFIG_OPTS[@]}" \
-      3>&1 1>&2 2>&3) || true
+if [[ "$_IMPORT_SCOPE" == "configs" ]]; then
+    # Auto-select config items — no checklist (avoids double-Enter dismissal)
+    [[ "$HAS_CONFIGS"  == true ]] && RESTORE_CONFIGS=true
+    [[ "$HAS_DOTFILES" == true ]] && RESTORE_DOTFILES=true
+    if [[ "$HAS_LOCAL" == true || "$HAS_STATE" == true || "$HAS_BIN" == true ]]; then
+        RESTORE_LOCAL=true
+    fi
+    _PLAN=""
+    [[ "$RESTORE_CONFIGS"  == true ]] && _PLAN+="  • ~/.config app directories\n"
+    [[ "$RESTORE_DOTFILES" == true ]] && _PLAN+="  • Home dotfiles (.bashrc, .zshrc etc.)\n"
+    [[ "$RESTORE_LOCAL"    == true ]] && _PLAN+="  • ~/.local (share, state, bin)\n"
+    [[ -z "$_PLAN" ]] && _PLAN="  (nothing found in bundle)\n"
+    whiptail --title "Configs to Restore" \
+      --msgbox "The following will be restored:\n\n${_PLAN}\nPress OK to begin." \
+      $BOX_H $BOX_W || true
+
+elif [[ "$_IMPORT_SCOPE" == "data" ]]; then
+    # Auto-select data items — no checklist
+    [[ "$HAS_FLATPAK"    == true ]] && RESTORE_FLATPAK=true
+    [[ "$HAS_BROWSERS"   == true ]] && RESTORE_BROWSERS=true
+    [[ "$HAS_GNOME"      == true ]] && RESTORE_GNOME=true
+    [[ "$HAS_SSH"        == true ]] && RESTORE_SSH=true
+    [[ "$HAS_FONTS"      == true ]] && RESTORE_FONTS=true
+    [[ "$HAS_STEAM"      == true ]] && RESTORE_STEAM=true
+    [[ "$HAS_HOMEDIRS"   == true ]] && RESTORE_HOMEDIRS=true
+    [[ "$HAS_USERHOMES"  == true ]] && RESTORE_USERHOMES=true
+    _PLAN=""
+    [[ "$RESTORE_FLATPAK"   == true ]] && _PLAN+="  • Flatpak app data (~/.var/app)\n"
+    [[ "$RESTORE_BROWSERS"  == true ]] && _PLAN+="  • Browser profiles\n"
+    [[ "$RESTORE_GNOME"     == true ]] && _PLAN+="  • GNOME settings (dconf + extensions)\n"
+    [[ "$RESTORE_SSH"       == true ]] && _PLAN+="  • SSH config & known_hosts\n"
+    [[ "$RESTORE_FONTS"     == true ]] && _PLAN+="  • User fonts\n"
+    [[ "$RESTORE_STEAM"     == true ]] && _PLAN+="  • Steam config & userdata\n"
+    [[ "$RESTORE_HOMEDIRS"  == true ]] && _PLAN+="  • XDG home dirs (Documents, Downloads etc.)\n"
+    [[ "$RESTORE_USERHOMES" == true ]] && _PLAN+="  • /home user directories (sudo)\n"
+    [[ -z "$_PLAN" ]] && _PLAN="  (nothing found in bundle)\n"
+    whiptail --title "Data to Restore" \
+      --msgbox "The following will be restored:\n\n${_PLAN}\nPress OK to begin." \
+      $BOX_H $BOX_W || true
+
 else
-    whiptail --title "Nothing to Restore" \
-      --msgbox "No restorable content was found in the bundle." \
-      10 $BOX_W
+    # "full" scope: interactive checklist
+    CONFIG_OPTS=()
+    [[ "$HAS_CONFIGS"  == true ]] && CONFIG_OPTS+=("configs"   "~/.config app directories ($(du -sh "$BUNDLE/configs/config-dirs" 2>/dev/null | awk '{print $1}'))" "ON")
+    [[ "$HAS_DOTFILES" == true ]] && CONFIG_OPTS+=("dotfiles"  "Home dotfiles (.bashrc, .zshrc, .gitconfig etc.)" "ON")
+    if [[ "$HAS_LOCAL" == true || "$HAS_STATE" == true || "$HAS_BIN" == true ]]; then
+        _local_label="~/.local app data — share"
+        [[ "$HAS_STATE" == true ]] && _local_label+=", state"
+        [[ "$HAS_BIN"   == true ]] && _local_label+=", bin"
+        _local_label+=" ($(du -shc "$BUNDLE/configs/local-share" "$BUNDLE/configs/local-state" "$BUNDLE/configs/local-bin" 2>/dev/null | tail -1 | awk '{print $1}'))"
+        CONFIG_OPTS+=("localshare" "$_local_label" "ON")
+    fi
+    [[ "$HAS_FLATPAK"    == true ]] && CONFIG_OPTS+=("flatpakdata" "Flatpak app data ~/.var/app ($(du -sh "$BUNDLE/flatpak/var-app" 2>/dev/null | awk '{print $1}'))" "ON")
+    [[ "$HAS_BROWSERS"   == true ]] && CONFIG_OPTS+=("browsers"    "Browser profiles ($(du -sh "$BUNDLE/browsers" 2>/dev/null | awk '{print $1}'))" "ON")
+    [[ "$HAS_GNOME"      == true ]] && CONFIG_OPTS+=("gnome"       "GNOME settings (dconf + extensions)" "ON")
+    [[ "$HAS_SSH"        == true ]] && CONFIG_OPTS+=("ssh"         "SSH config & known_hosts (keys NOT copied)" "ON")
+    [[ "$HAS_FONTS"      == true ]] && CONFIG_OPTS+=("fonts"       "User fonts ($(du -sh "$BUNDLE/fonts" 2>/dev/null | awk '{print $1}'))" "ON")
+    [[ "$HAS_STEAM"      == true ]] && CONFIG_OPTS+=("steam"       "Steam config & userdata (no game files)" "ON")
+    [[ "$HAS_HOMEDIRS"   == true ]] && CONFIG_OPTS+=("homedirs"    "XDG home dirs — Documents, Downloads, Pictures etc. ($(du -sh "$BUNDLE/homedirs" 2>/dev/null | awk '{print $1}'))" "ON")
+    [[ "$HAS_USERHOMES"  == true ]] && CONFIG_OPTS+=("userhomes"   "/home user directories ($(du -sh "$BUNDLE/user-homes" 2>/dev/null | awk '{print $1}')) — requires sudo" "ON")
+
+    RESTORE_CHOICES=""
+    if [[ "${#CONFIG_OPTS[@]}" -gt 0 ]]; then
+        RESTORE_CHOICES=$(whiptail --title "Stage 2 of 2: Select What to Restore" \
+          --checklist \
+"Everything is pre-selected. Uncheck anything you want to skip.
+Space = toggle  |  Tab = move to OK/Cancel  |  Enter = confirm  |  Esc = cancel" \
+          $BOX_H $BOX_W $(( BOX_H - 10 )) \
+          "${CONFIG_OPTS[@]}" \
+          3>&1 1>&2 2>&3) || true
+    else
+        whiptail --title "Nothing to Restore" \
+          --msgbox "No restorable content was found in the bundle." \
+          10 $BOX_W || true
+    fi
+
+    [[ "$RESTORE_CHOICES" == *'"configs"'*     ]] && RESTORE_CONFIGS=true
+    [[ "$RESTORE_CHOICES" == *'"dotfiles"'*    ]] && RESTORE_DOTFILES=true
+    [[ "$RESTORE_CHOICES" == *'"localshare"'*  ]] && RESTORE_LOCAL=true
+    [[ "$RESTORE_CHOICES" == *'"flatpakdata"'* ]] && RESTORE_FLATPAK=true
+    [[ "$RESTORE_CHOICES" == *'"browsers"'*    ]] && RESTORE_BROWSERS=true
+    [[ "$RESTORE_CHOICES" == *'"gnome"'*       ]] && RESTORE_GNOME=true
+    [[ "$RESTORE_CHOICES" == *'"ssh"'*         ]] && RESTORE_SSH=true
+    [[ "$RESTORE_CHOICES" == *'"fonts"'*       ]] && RESTORE_FONTS=true
+    [[ "$RESTORE_CHOICES" == *'"steam"'*       ]] && RESTORE_STEAM=true
+    [[ "$RESTORE_CHOICES" == *'"homedirs"'*    ]] && RESTORE_HOMEDIRS=true
+    [[ "$RESTORE_CHOICES" == *'"userhomes"'*   ]] && RESTORE_USERHOMES=true
 fi
 
-# Parse selections
-RESTORE_CONFIGS=false;    [[ "$RESTORE_CHOICES" == *'"configs"'*     ]] && RESTORE_CONFIGS=true
-RESTORE_DOTFILES=false;   [[ "$RESTORE_CHOICES" == *'"dotfiles"'*    ]] && RESTORE_DOTFILES=true
-RESTORE_LOCAL=false;      [[ "$RESTORE_CHOICES" == *'"localshare"'*  ]] && RESTORE_LOCAL=true
-RESTORE_FLATPAK=false;    [[ "$RESTORE_CHOICES" == *'"flatpakdata"'* ]] && RESTORE_FLATPAK=true
-RESTORE_BROWSERS=false;   [[ "$RESTORE_CHOICES" == *'"browsers"'*    ]] && RESTORE_BROWSERS=true
-RESTORE_GNOME=false;      [[ "$RESTORE_CHOICES" == *'"gnome"'*       ]] && RESTORE_GNOME=true
-RESTORE_SSH=false;        [[ "$RESTORE_CHOICES" == *'"ssh"'*         ]] && RESTORE_SSH=true
-RESTORE_FONTS=false;      [[ "$RESTORE_CHOICES" == *'"fonts"'*       ]] && RESTORE_FONTS=true
-RESTORE_STEAM=false;      [[ "$RESTORE_CHOICES" == *'"steam"'*       ]] && RESTORE_STEAM=true
-RESTORE_HOMEDIRS=false;   [[ "$RESTORE_CHOICES" == *'"homedirs"'*    ]] && RESTORE_HOMEDIRS=true
-RESTORE_USERHOMES=false;  [[ "$RESTORE_CHOICES" == *'"userhomes"'*   ]] && RESTORE_USERHOMES=true
-
 # ── Run restores ──────────────────────────────────────────────────────────────
-echo ""
-header "PHASE 3: Restoring configs..."
 
 if [[ "$RESTORE_CONFIGS" == true ]]; then
-    step "~/.config..."; do_copy "$BUNDLE/configs/config-dirs/." "$HOME/.config"; ok "~/.config restored"; log_import "RESTORED: ~/.config"
+    step "~/.config..."; do_copy "$BUNDLE/configs/config-dirs/." "$HOME/.config" --force; ok "~/.config restored"; log_import "RESTORED: ~/.config"
 fi
 if [[ "$RESTORE_DOTFILES" == true ]]; then
     step "Dotfiles..."; do_copy "$BUNDLE/configs/dotfiles/." "$HOME"; ok "Dotfiles restored"; log_import "RESTORED: dotfiles"
 fi
 if [[ "$RESTORE_LOCAL" == true ]]; then
-    step "~/.local/share..."; do_copy "$BUNDLE/configs/local-share/." "$HOME/.local/share"; ok "~/.local/share restored"; log_import "RESTORED: ~/.local/share"
+    [[ "$HAS_LOCAL" == true ]] && { step "~/.local/share..."; do_copy "$BUNDLE/configs/local-share/." "$HOME/.local/share" --force; ok "~/.local/share restored"; log_import "RESTORED: ~/.local/share"; }
+    [[ "$HAS_STATE" == true ]] && { step "~/.local/state..."; do_copy "$BUNDLE/configs/local-state/." "$HOME/.local/state" --force; ok "~/.local/state restored"; log_import "RESTORED: ~/.local/state"; }
+    [[ "$HAS_BIN"   == true ]] && { step "~/.local/bin...";   do_copy "$BUNDLE/configs/local-bin/."   "$HOME/.local/bin"   --force; ok "~/.local/bin restored";   log_import "RESTORED: ~/.local/bin"; chmod +x "$HOME/.local/bin/"* 2>/dev/null || true; }
+    # Shotwell DB needs force-copy — Shotwell auto-creates an empty photo.db on first launch
+    # which cp -rn (no-overwrite) would silently skip, leaving an empty library
+    if [[ -d "$BUNDLE/configs/local-share/shotwell" ]] && [[ "$DRY_RUN" == false ]]; then
+        mkdir -p "$HOME/.local/share/shotwell"
+        cp -rf "$BUNDLE/configs/local-share/shotwell/." "$HOME/.local/share/shotwell/" 2>/dev/null || true
+        ok "Shotwell database force-copied"
+        log_import "RESTORED: Shotwell database (force-copy)"
+        warn "Shotwell: photo paths are absolute — if your username or photo folder path changed, use File → Relocate Missing Files."
+    fi
 fi
 if [[ "$RESTORE_FLATPAK" == true ]]; then
     step "Flatpak data..."; do_copy "$BUNDLE/flatpak/var-app/." "$HOME/.var/app"; ok "Flatpak data restored"; log_import "RESTORED: ~/.var/app"
@@ -3033,6 +3220,8 @@ if [[ "$RESTORE_USERHOMES" == true ]]; then
     done
 fi
 
+fi # _SKIP_CONFIGS
+
 # ── CUPS restore ─────────────────────────────────────────────────────────────
 if [[ "$IMP_NO_CUPS" == false ]] && [[ -d "$BUNDLE/cups" ]] && [[ -n "$(ls "$BUNDLE/cups/" 2>/dev/null)" ]]; then
     CUPS_Q=$(grep -c "^<Printer " "$BUNDLE/cups/printers.conf" 2>/dev/null || echo 0)
@@ -3060,7 +3249,7 @@ USB printers: plug your printer in and CUPS should
 reconnect automatically on next print job.
 
 Network printers (IPP/socket): should work immediately
-if the IP address hasn't changed."               $BOX_H $BOX_W
+if the IP address hasn't changed."               $BOX_H $BOX_W || true
         else
             warn "CUPS: verify printers at http://localhost:631 or lpstat -v"
         fi
@@ -3120,7 +3309,7 @@ DIFFERENT MONITOR?
 
 Profile loading on login:
   The autostart entry has been restored to ~/.config/autostart/
-  displaycal-apply-profiles will run on next login."               $BOX_H $BOX_W
+  displaycal-apply-profiles will run on next login."               $BOX_H $BOX_W || true
         else
             warn "DisplayCAL: same monitor = auto. Different monitor = re-run calibration or use colormgr."
         fi
@@ -3323,12 +3512,38 @@ if [[ "$IMP_NO_PACKAGES" == false ]]; then
     fi
 fi
 
+# ── AppImage portable configs (non-TUI) ──────────────────────────────────────
+if [[ -f "$BUNDLE/packages/appimage-portable-manifest.txt" ]]; then
+    while IFS="|" read -r _ai _pd _slot; do
+        if [[ -d "$(dirname "$_ai")" ]] && [[ "$DRY_RUN" == false ]]; then
+            mkdir -p "$_pd"
+            cp -r "$BUNDLE/packages/appimage-portable/$_slot/." "$_pd/" 2>/dev/null || true
+            ok "AppImage portable config restored: $_pd"
+            log_import "RESTORED: AppImage portable config: $_pd"
+        else
+            add_manual "AppImage portable config — copy manually after placing AppImage: cp -r \"$BUNDLE/packages/appimage-portable/$_slot/.\" \"$_pd/\""
+            [[ "$DRY_RUN" == true ]] && info "[DRY RUN] would restore portable config: $_pd" \
+                || warn "AppImage portable config not restored (AppImage dir missing): $_pd"
+        fi
+    done < "$BUNDLE/packages/appimage-portable-manifest.txt"
+fi
+
 # ── Configs ───────────────────────────────────────────────────────────────────
 header "PHASE 3: Restoring configs..."
 
-[[ "$IMP_NO_CONFIGS" == false && "$HAS_CONFIGS"  == true ]] && { step "~/.config...";      do_copy "$BUNDLE/configs/config-dirs/." "$HOME/.config";      ok "done"; log_import "RESTORED: ~/.config"; }
+[[ "$IMP_NO_CONFIGS" == false && "$HAS_CONFIGS"  == true ]] && { step "~/.config...";      do_copy "$BUNDLE/configs/config-dirs/." "$HOME/.config" --force; ok "done"; log_import "RESTORED: ~/.config"; }
 [[ "$IMP_NO_CONFIGS" == false && "$HAS_DOTFILES" == true ]] && { step "Dotfiles...";       do_copy "$BUNDLE/configs/dotfiles/."    "$HOME";              ok "done"; log_import "RESTORED: dotfiles"; }
-[[ "$IMP_NO_CONFIGS" == false && "$HAS_LOCAL"    == true ]] && { step "~/.local/share..."; do_copy "$BUNDLE/configs/local-share/." "$HOME/.local/share"; ok "done"; log_import "RESTORED: ~/.local/share"; }
+if [[ "$IMP_NO_CONFIGS" == false ]] && [[ "$HAS_LOCAL" == true || "$HAS_STATE" == true || "$HAS_BIN" == true ]]; then
+    [[ "$HAS_LOCAL" == true ]] && { step "~/.local/share..."; do_copy "$BUNDLE/configs/local-share/." "$HOME/.local/share" --force; ok "done"; log_import "RESTORED: ~/.local/share"; }
+    [[ "$HAS_STATE" == true ]] && { step "~/.local/state..."; do_copy "$BUNDLE/configs/local-state/." "$HOME/.local/state" --force; ok "done"; log_import "RESTORED: ~/.local/state"; }
+    [[ "$HAS_BIN"   == true ]] && { step "~/.local/bin...";   do_copy "$BUNDLE/configs/local-bin/."   "$HOME/.local/bin"   --force; ok "done"; log_import "RESTORED: ~/.local/bin"; chmod +x "$HOME/.local/bin/"* 2>/dev/null || true; }
+    if [[ -d "$BUNDLE/configs/local-share/shotwell" ]] && [[ "$DRY_RUN" == false ]]; then
+        mkdir -p "$HOME/.local/share/shotwell"
+        cp -rf "$BUNDLE/configs/local-share/shotwell/." "$HOME/.local/share/shotwell/" 2>/dev/null || true
+        ok "Shotwell database force-copied"; log_import "RESTORED: Shotwell database (force-copy)"
+        warn "Shotwell: if username or photo folder path changed, use File → Relocate Missing Files."
+    fi
+fi
 [[ "$IMP_NO_FLATPAK" == false && "$HAS_FLATPAK"  == true ]] && { step "Flatpak data...";   do_copy "$BUNDLE/flatpak/var-app/."     "$HOME/.var/app";     ok "done"; log_import "RESTORED: ~/.var/app"; }
 
 if [[ "$IMP_NO_BROWSERS" == false && "$HAS_BROWSERS" == true ]]; then
@@ -3527,12 +3742,10 @@ echo "    • Enable GNOME extensions via Extensions app"
 echo "      (Settings → Extensions — they are installed but off by default)"
 echo "    • If GNOME keyboard shortcuts / settings were not restored, run from"
 echo "      a terminal inside GNOME:  dconf load / < $BUNDLE/gnome/dconf-full.ini"
-echo "    • AppImage configs: ~/.config is restored with no-overwrite mode."
-echo "      If an app was already launched on this system (creating a default config),"
-echo "      its old settings were skipped. To force-restore a specific app:"
-echo "        cp -rf $BUNDLE/configs/config-dirs/<AppName> ~/.config/"
-echo "      Some AppImages use a portable config folder next to the .AppImage file"
-echo "      — those are NOT captured and must be copied manually."
+echo "    • App configs (~/.config) were restored with overwrite — bundle settings"
+echo "      replaced any defaults the new system created on first app launch."
+echo "      AppImage portable configs (stored next to the .AppImage file) are in"
+echo "      packages/appimage-portable/ and were auto-restored where possible."
 echo "    • Verify GPU drivers"
 echo "    • Reboot  ← required for services to start correctly"
 echo ""

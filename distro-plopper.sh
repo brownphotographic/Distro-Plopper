@@ -248,6 +248,7 @@ EXP_GNOME=true
 EXP_SSH=true
 EXP_FONTS=true
 EXP_NFS=true
+EXP_AUTOFS=true
 EXP_SYSTEMD=true
 EXP_DOCKER=true
 EXP_HARDWARE=true
@@ -623,6 +624,28 @@ NFS_EXPORTS=false; NFS_MOUNTS=false
 grep -qE '\bnfs\b|\bnfs4\b' /etc/fstab 2>/dev/null && NFS_MOUNTS=true
 SCAN_RESULTS[nfs_exports]="$NFS_EXPORTS"; SCAN_RESULTS[nfs_mounts]="$NFS_MOUNTS"
 ok "NFS: exports=$NFS_EXPORTS, fstab mounts=$NFS_MOUNTS"
+
+# S10b. AutoFS
+info "Scanning autofs..."
+AUTOFS_CONFIGURED=false; AUTOFS_ENABLED=false
+[[ -f /etc/auto.master ]] && grep -qvE '^#|^$' /etc/auto.master 2>/dev/null && AUTOFS_CONFIGURED=true
+[[ -d /etc/auto.master.d ]] && [[ -n "$(find /etc/auto.master.d -maxdepth 1 -type f 2>/dev/null)" ]] && AUTOFS_CONFIGURED=true
+systemctl is-enabled autofs &>/dev/null && AUTOFS_ENABLED=true
+# Collect map file paths referenced by the master map (skip +include directives
+# and non-file map types like ldap:/yp: — those can't be exported as files)
+> "$SCAN_TMP/autofs-maps-resolved.txt"
+{ [[ -f /etc/auto.master ]] && grep -vE '^#|^$' /etc/auto.master 2>/dev/null | awk '{print $2}'
+  for f in /etc/auto.master.d/*; do
+      [[ -f "$f" ]] && grep -vE '^#|^$' "$f" 2>/dev/null | awk '{print $2}'
+  done
+} 2>/dev/null | sed 's/^file://' | while IFS= read -r m; do
+    [[ -z "$m" || "$m" == +* ]] && continue
+    [[ -f "$m" ]] && echo "$m"
+done | sort -u > "$SCAN_TMP/autofs-maps-resolved.txt" || true
+SCAN_RESULTS[autofs_configured]="$AUTOFS_CONFIGURED"
+SCAN_RESULTS[autofs_enabled]="$AUTOFS_ENABLED"
+SCAN_RESULTS[autofs_map_count]=$(wc -l < "$SCAN_TMP/autofs-maps-resolved.txt")
+ok "autofs: configured=$AUTOFS_CONFIGURED, service enabled=$AUTOFS_ENABLED, map files=${SCAN_RESULTS[autofs_map_count]}"
 
 # S11. SSH
 info "Scanning SSH..."
@@ -1000,6 +1023,26 @@ $(grep -E '\bnfs\b|\bnfs4\b' /etc/fstab 2>/dev/null || echo "(none)")
 
 ---
 
+## AutoFS
+
+| Item | Status |
+|------|--------|
+| /etc/auto.master configured | ${SCAN_RESULTS[autofs_configured]:-false} |
+| autofs service enabled | ${SCAN_RESULTS[autofs_enabled]:-false} |
+| Local map files found | ${SCAN_RESULTS[autofs_map_count]:-0} |
+
+### /etc/auto.master
+\`\`\`
+$(cat /etc/auto.master 2>/dev/null || echo "(not found)")
+\`\`\`
+
+### Map files (local file-based maps only)
+\`\`\`
+$(cat "$SCAN_TMP/autofs-maps-resolved.txt" 2>/dev/null || echo "(none)")
+\`\`\`
+
+---
+
 ## SSH
 | Item | Detail |
 |------|--------|
@@ -1174,6 +1217,7 @@ printf "  %-30s %s\n" "User fonts:"       "${SCAN_RESULTS[font_count]:-0} files"
 printf "  %-30s %s\n" "SSH private keys:" "${SCAN_RESULTS[ssh_key_count]:-0}  (NOT auto-copied)"
 printf "  %-30s %s\n" "NFS exports:"      "${SCAN_RESULTS[nfs_exports]:-false}"
 printf "  %-30s %s\n" "NFS fstab mounts:" "${SCAN_RESULTS[nfs_mounts]:-false}"
+printf "  %-30s %s\n" "AutoFS configured:" "${SCAN_RESULTS[autofs_configured]:-false}"
 printf "  %-30s %s\n" "XDG home dirs:"    "${SCAN_RESULTS[home_dirs_count]:-0} dirs  (${SCAN_RESULTS[home_dirs_total]:-0} total)"
 printf "  %-30s %s\n" "/home/ users:"     "${SCAN_RESULTS[user_homes_count]:-0} found"
 echo ""
@@ -1283,6 +1327,7 @@ EXP_OPTS+=("gnome"       "GNOME — dconf settings + ${SCAN_RESULTS[gnome_ext_co
 EXP_OPTS+=("ssh"         "SSH config & known_hosts (private keys NOT copied)" "ON")
 EXP_OPTS+=("fonts"       "User fonts — ${SCAN_RESULTS[font_count]:-0} files" "ON")
 EXP_OPTS+=("nfs"         "NFS — exports=${SCAN_RESULTS[nfs_exports]:-false}, fstab mounts=${SCAN_RESULTS[nfs_mounts]:-false}" "ON")
+EXP_OPTS+=("autofs"      "AutoFS — configured=${SCAN_RESULTS[autofs_configured]:-false}, ${SCAN_RESULTS[autofs_map_count]:-0} map file(s)" "ON")
 EXP_OPTS+=("systemd"     "Systemd enabled services (system + user)" "ON")
 EXP_OPTS+=("docker"      "Docker inventory — images, volumes, containers (no data)" "ON")
 EXP_OPTS+=("hardware"    "Hardware notes — GPU, audio, kernel modules" "ON")
@@ -1354,6 +1399,7 @@ EXP_GNOME=false;       [[ "$EXPORT_CHOICES" == *'"gnome"'*       ]] && EXP_GNOME
 EXP_SSH=false;         [[ "$EXPORT_CHOICES" == *'"ssh"'*         ]] && EXP_SSH=true
 EXP_FONTS=false;       [[ "$EXPORT_CHOICES" == *'"fonts"'*       ]] && EXP_FONTS=true
 EXP_NFS=false;         [[ "$EXPORT_CHOICES" == *'"nfs"'*         ]] && EXP_NFS=true
+EXP_AUTOFS=false;      [[ "$EXPORT_CHOICES" == *'"autofs"'*      ]] && EXP_AUTOFS=true
 EXP_SYSTEMD=false;     [[ "$EXPORT_CHOICES" == *'"systemd"'*     ]] && EXP_SYSTEMD=true
 EXP_DOCKER=false;      [[ "$EXPORT_CHOICES" == *'"docker"'*      ]] && EXP_DOCKER=true
 EXP_HARDWARE=false;    [[ "$EXPORT_CHOICES" == *'"hardware"'*    ]] && EXP_HARDWARE=true
@@ -1468,6 +1514,7 @@ if [[ "$EXP_USERHOMES" == true ]]; then
     done < "$SCAN_TMP/user-homes-selected.txt"
 fi
 [[ "$EXP_NFS"        == true ]] && SELECTED_LIST+="  ✓ NFS configuration\n"
+[[ "$EXP_AUTOFS"     == true ]] && SELECTED_LIST+="  ✓ AutoFS configuration\n"
 [[ "$EXP_SYSTEMD"    == true ]] && SELECTED_LIST+="  ✓ Systemd services\n"
 [[ "$EXP_DOCKER"     == true ]] && SELECTED_LIST+="  ✓ Docker inventory\n"
 [[ "$EXP_HARDWARE"   == true ]] && SELECTED_LIST+="  ✓ Hardware notes\n"
@@ -1489,7 +1536,7 @@ Start export?" \
 else
 # ── Non-TUI fallback: honour CLI flags as before ──────────────────────────────
 EXP_PACKAGES=true; EXP_CONFIGS=true; EXP_DOTFILES=true; EXP_LOCALSHARE=true
-EXP_GNOME=true; EXP_SSH=true; EXP_FONTS=true; EXP_NFS=true
+EXP_GNOME=true; EXP_SSH=true; EXP_FONTS=true; EXP_NFS=true; EXP_AUTOFS=true
 EXP_SYSTEMD=true; EXP_DOCKER=true; EXP_HARDWARE=true
 EXP_FLATPAKDATA=$( [[ "$SKIP_FLATPAK_DATA" == false ]] && echo true || echo false)
 EXP_BROWSERS=$(    [[ "$SKIP_BROWSERS"      == false ]] && echo true || echo false)
@@ -1561,7 +1608,7 @@ copy_with_spinner() {
 # PHASE 2: CREATE OUTPUT STRUCTURE
 # =============================================================================
 header "PHASE 2: Creating output structure..."
-mkdir -p "$OUTPUT_DIR"/{packages,configs/{dotfiles,config-dirs,local-share,local-state,local-bin},flatpak,browsers,gnome/extensions-backup,nfs,ssh,fonts,systemd,docker,hardware,steam,homedirs,user-homes,scripts}
+mkdir -p "$OUTPUT_DIR"/{packages,configs/{dotfiles,config-dirs,local-share,local-state,local-bin},flatpak,browsers,gnome/extensions-backup,nfs,autofs,ssh,fonts,systemd,docker,hardware,steam,homedirs,user-homes,scripts}
 
 MD="$OUTPUT_DIR/MIGRATION_REPORT.md"
 
@@ -1828,6 +1875,36 @@ grep -E '\bnfs\b|\bnfs4\b' /etc/fstab 2>/dev/null >> "$MD" || log_md "(none)"
 log_md '```'
 log_md "### Full /etc/fstab"; log_md '```'; cat /etc/fstab >> "$MD"; log_md '```'
 fi # EXP_NFS
+
+# ── AutoFS ────────────────────────────────────────────────────────────────────
+if [[ "$EXP_AUTOFS" == true ]]; then
+section_md "8b. AutoFS"
+[[ -f /etc/auto.master ]] && cp -p /etc/auto.master "$OUTPUT_DIR/autofs/" 2>/dev/null || true
+if [[ -d /etc/auto.master.d ]] && [[ -n "$(find /etc/auto.master.d -maxdepth 1 -type f 2>/dev/null)" ]]; then
+    mkdir -p "$OUTPUT_DIR/autofs/auto.master.d"
+    cp -p /etc/auto.master.d/* "$OUTPUT_DIR/autofs/auto.master.d/" 2>/dev/null || true
+fi
+> "$OUTPUT_DIR/autofs/map-file-list.txt"
+if [[ -s "$SCAN_TMP/autofs-maps-resolved.txt" ]]; then
+    mkdir -p "$OUTPUT_DIR/autofs/maps"
+    while IFS= read -r m; do
+        [[ -f "$m" ]] || continue
+        SAFE_NAME=$(echo "$m" | sed 's#^/##; s#/#_#g')
+        # -p preserves the executable bit — some maps are executable "program maps"
+        cp -p "$m" "$OUTPUT_DIR/autofs/maps/$SAFE_NAME" 2>/dev/null || true
+        echo "$m|$SAFE_NAME" >> "$OUTPUT_DIR/autofs/map-file-list.txt"
+    done < "$SCAN_TMP/autofs-maps-resolved.txt"
+fi
+echo "autofs_configured=${SCAN_RESULTS[autofs_configured]:-false}" >> "$MANIFEST"
+echo "autofs_enabled=${SCAN_RESULTS[autofs_enabled]:-false}" >> "$MANIFEST"
+log_md "### /etc/auto.master"; log_md '```'
+[[ -f /etc/auto.master ]] && cat /etc/auto.master >> "$MD" || log_md "(not found)"
+log_md '```'
+log_md "### Map files backed up"; log_md '```'
+cat "$SCAN_TMP/autofs-maps-resolved.txt" 2>/dev/null >> "$MD" || log_md "(none)"
+log_md '```'
+ok "AutoFS config copied"
+fi # EXP_AUTOFS
 
 # ── SSH ───────────────────────────────────────────────────────────────────────
 if [[ "$EXP_SSH" == true ]]; then
@@ -2144,6 +2221,11 @@ cat >> "$MD" << 'CHECKLIST'
 ### NFS
 - [ ] Restore `/etc/exports` → `sudo exportfs -ra`
 - [ ] NFS fstab lines inserted automatically; daemon-reload and mount -a run
+
+### AutoFS
+- [ ] autofs package installed and `/etc/auto.master` + map files restored automatically
+- [ ] `sudo systemctl enable --now autofs` (run automatically on import)
+- [ ] Verify by cd-ing into an automount path — it should mount on access
 
 ### Fonts
 - [ ] `cp -r fonts/. ~/.local/share/fonts/ && fc-cache -fv`
@@ -2477,6 +2559,9 @@ NFS_MNT=$(get_manifest "nfs_mounts"  "false")
 NFS_FSTAB_FILE=""
 [[ -f "$BUNDLE/nfs/fstab-nfs-lines" ]] && NFS_FSTAB_FILE="$BUNDLE/nfs/fstab-nfs-lines"
 [[ -z "$NFS_FSTAB_FILE" && -f "$BUNDLE/nfs/fstab" ]] && NFS_FSTAB_FILE="$BUNDLE/nfs/fstab"
+AUTOFS_CONF=$(get_manifest "autofs_configured" "false")
+AUTOFS_SVC_ENABLED=$(get_manifest "autofs_enabled" "false")
+HAS_AUTOFS=$( [[ -f "$BUNDLE/autofs/auto.master" ]] && echo true || echo false)
 
 SOURCE_OS=$(grep "^# Source OS:" "$MANIFEST" 2>/dev/null | cut -d: -f2- | xargs || echo "unknown")
 SOURCE_HOST=$(grep "^# Source host:" "$MANIFEST" 2>/dev/null | cut -d: -f2- | xargs || echo "unknown")
@@ -2497,6 +2582,7 @@ BOX_H=$(( TERM_H - 4 )); BOX_W=$(( TERM_W - 8 ))
 # ── Screen 1: Bundle summary ─────────────────────────────────────────────────
 TP_IN_BUNDLE=$( [[ -d "$BUNDLE/turboprint" ]] && echo "yes" || echo "no" )
 NFS_IN_BUNDLE=$( [[ "$NFS_MNT" == "true" || "$NFS_EXP" == "true" ]] && echo "yes" || echo "no" )
+AUTOFS_IN_BUNDLE=$( [[ "$HAS_AUTOFS" == true ]] && echo "yes" || echo "no" )
 
 whiptail --title "🪣  Distro Plopper — Import" \
   --msgbox "\
@@ -2514,6 +2600,7 @@ Contents:
   • Browsers, GNOME, SSH, Fonts, Steam
   • TurboPrint: $TP_IN_BUNDLE
   • NFS mounts: $NFS_IN_BUNDLE
+  • AutoFS: $AUTOFS_IN_BUNDLE
 
 Press OK to review the pre-flight checklist." \
   $BOX_H $BOX_W || true
@@ -2592,6 +2679,15 @@ if [[ "$NFS_IN_BUNDLE" == "yes" ]]; then
     PREFLIGHT_MSG+="   (NFS fstab lines will be inserted automatically)\n"
 fi
 
+if [[ "$AUTOFS_IN_BUNDLE" == "yes" ]]; then
+    PREFLIGHT_MSG+="\n─────────────────────────────────────────────\n"
+    PREFLIGHT_MSG+="AUTOFS:\n"
+    PREFLIGHT_MSG+="─────────────────────────────────────────────\n"
+    PREFLIGHT_MSG+="□  autofs package will be installed automatically if missing\n"
+    PREFLIGHT_MSG+="□  NFS/SMB server(s) referenced by the autofs maps are reachable\n"
+    PREFLIGHT_MSG+="   (/etc/auto.master + map files restored, service enabled)\n"
+fi
+
 PREFLIGHT_MSG+="\n─────────────────────────────────────────────\n"
 PREFLIGHT_MSG+="AFTER IMPORT — MANUAL STEPS STILL NEEDED:\n"
 PREFLIGHT_MSG+="─────────────────────────────────────────────\n"
@@ -2636,8 +2732,9 @@ installed before their configs are restored:
     2m. DisplayCAL / ArgyllCMS profiles
 
   Stage 3 — System
-    3a. NFS  (shown for manual action)
-    3b. Summary & remaining manual steps
+    3a. NFS  (fstab lines inserted automatically)
+    3b. AutoFS  (package installed, maps restored, service enabled)
+    3c. Summary & remaining manual steps
 
 Press OK to begin." \
   $BOX_H $BOX_W || true
@@ -3357,6 +3454,63 @@ if [[ "$NFS_MNT" == "true" ]] || [[ "$NFS_EXP" == "true" ]]; then
     [[ -n "$NFS_MSG" ]] && whiptail --title "NFS" --msgbox "$NFS_MSG" $BOX_H $BOX_W
 fi
 
+# ── AutoFS ────────────────────────────────────────────────────────────────────
+AUTOFS_MSG=""
+if [[ "$HAS_AUTOFS" == true ]]; then
+    if [[ "$DRY_RUN" == false ]]; then
+        if ! systemctl list-unit-files autofs.service &>/dev/null && ! command -v automount &>/dev/null; then
+            case "$PKG_FAMILY" in
+                arch)   sudo pacman -S --needed --noconfirm autofs 2>/dev/null && AUTOFS_MSG+="✓ autofs package installed\n" || AUTOFS_MSG+="⚠ autofs install failed — install manually\n" ;;
+                fedora) sudo dnf install -y autofs 2>/dev/null && AUTOFS_MSG+="✓ autofs package installed\n" || AUTOFS_MSG+="⚠ autofs install failed — install manually\n" ;;
+                debian) sudo apt install -y autofs 2>/dev/null && AUTOFS_MSG+="✓ autofs package installed\n" || AUTOFS_MSG+="⚠ autofs install failed — install manually\n" ;;
+                suse)   sudo zypper install -y autofs 2>/dev/null && AUTOFS_MSG+="✓ autofs package installed\n" || AUTOFS_MSG+="⚠ autofs install failed — install manually\n" ;;
+                *)      AUTOFS_MSG+="⚠ Unknown distro — install autofs manually\n" ;;
+            esac
+        else
+            AUTOFS_MSG+="✓ autofs already installed\n"
+        fi
+        if [[ -f "$BUNDLE/autofs/auto.master" ]]; then
+            [[ -f /etc/auto.master ]] || sudo touch /etc/auto.master
+            AM_INSERTED=(); AM_SKIPPED=()
+            while IFS= read -r line; do
+                [[ -z "$line" || "$line" == \#* ]] && continue
+                if grep -qF "$line" /etc/auto.master 2>/dev/null; then
+                    AM_SKIPPED+=("$line")
+                else
+                    echo "$line" | sudo tee -a /etc/auto.master > /dev/null
+                    AM_INSERTED+=("$line")
+                fi
+            done < "$BUNDLE/autofs/auto.master"
+            if [[ ${#AM_INSERTED[@]} -gt 0 ]]; then
+                AUTOFS_MSG+="\nAdded to /etc/auto.master:\n"
+                for l in "${AM_INSERTED[@]}"; do AUTOFS_MSG+="  $l\n"; done
+            fi
+            [[ ${#AM_SKIPPED[@]} -gt 0 ]] && { AUTOFS_MSG+="Already present (skipped):\n"; for l in "${AM_SKIPPED[@]}"; do AUTOFS_MSG+="  $l\n"; done; }
+        fi
+        if [[ -d "$BUNDLE/autofs/auto.master.d" ]] && [[ -n "$(ls "$BUNDLE/autofs/auto.master.d/" 2>/dev/null)" ]]; then
+            sudo mkdir -p /etc/auto.master.d
+            sudo cp -pn "$BUNDLE/autofs/auto.master.d/"* /etc/auto.master.d/ 2>/dev/null || true
+            AUTOFS_MSG+="✓ auto.master.d includes restored\n"
+        fi
+        if [[ -s "$BUNDLE/autofs/map-file-list.txt" ]]; then
+            while IFS='|' read -r orig_path safe_name; do
+                [[ -z "$orig_path" ]] && continue
+                sudo mkdir -p "$(dirname "$orig_path")"
+                # -p preserves the executable bit — some maps are executable "program maps"
+                sudo cp -p "$BUNDLE/autofs/maps/$safe_name" "$orig_path" 2>/dev/null \
+                    && AUTOFS_MSG+="✓ Restored map: $orig_path\n" \
+                    || AUTOFS_MSG+="⚠ Failed to restore map: $orig_path\n"
+            done < "$BUNDLE/autofs/map-file-list.txt"
+        fi
+        sudo systemctl enable --now autofs 2>/dev/null \
+            && { AUTOFS_MSG+="✓ autofs service enabled and started\n"; log_import "RESTORED: AutoFS"; } \
+            || AUTOFS_MSG+="⚠ Could not enable/start autofs — run: sudo systemctl enable --now autofs\n"
+    else
+        AUTOFS_MSG+="[DRY RUN] Would install autofs, restore /etc/auto.master + map files, and enable the service\n"
+    fi
+    [[ -n "$AUTOFS_MSG" ]] && whiptail --title "AutoFS" --msgbox "$AUTOFS_MSG" $BOX_H $BOX_W
+fi
+
 # ── Save import summary ───────────────────────────────────────────────────────
 SUMMARY_FILENAME="distro-plopper-summary-${TIMESTAMP}.txt"
 _SUMMARY_CHOICE=$(whiptail --title "Save Import Summary" \
@@ -3712,6 +3866,55 @@ if [[ "$NFS_MNT" == "true" ]] && [[ -n "$NFS_FSTAB_FILE" ]]; then
     fi
 fi
 
+if [[ "$HAS_AUTOFS" == true ]]; then
+    if [[ "$DRY_RUN" == false ]]; then
+        info "AutoFS — installing package and restoring config..."
+        if ! systemctl list-unit-files autofs.service &>/dev/null && ! command -v automount &>/dev/null; then
+            case "$PKG_FAMILY" in
+                arch)   sudo pacman -S --needed --noconfirm autofs 2>/dev/null && ok "autofs package installed" || warn "autofs install failed — install manually" ;;
+                fedora) sudo dnf install -y autofs 2>/dev/null && ok "autofs package installed" || warn "autofs install failed — install manually" ;;
+                debian) sudo apt install -y autofs 2>/dev/null && ok "autofs package installed" || warn "autofs install failed — install manually" ;;
+                suse)   sudo zypper install -y autofs 2>/dev/null && ok "autofs package installed" || warn "autofs install failed — install manually" ;;
+                *)      warn "Unknown distro — install autofs manually" ;;
+            esac
+        else
+            ok "autofs already installed"
+        fi
+        if [[ -f "$BUNDLE/autofs/auto.master" ]]; then
+            [[ -f /etc/auto.master ]] || sudo touch /etc/auto.master
+            while IFS= read -r line; do
+                [[ -z "$line" || "$line" == \#* ]] && continue
+                if grep -qF "$line" /etc/auto.master 2>/dev/null; then
+                    ok "  Already present: $line"
+                else
+                    echo "$line" | sudo tee -a /etc/auto.master > /dev/null
+                    ok "  Added: $line"
+                fi
+            done < "$BUNDLE/autofs/auto.master"
+        fi
+        if [[ -d "$BUNDLE/autofs/auto.master.d" ]] && [[ -n "$(ls "$BUNDLE/autofs/auto.master.d/" 2>/dev/null)" ]]; then
+            sudo mkdir -p /etc/auto.master.d
+            sudo cp -pn "$BUNDLE/autofs/auto.master.d/"* /etc/auto.master.d/ 2>/dev/null || true
+            ok "auto.master.d includes restored"
+        fi
+        if [[ -s "$BUNDLE/autofs/map-file-list.txt" ]]; then
+            while IFS='|' read -r orig_path safe_name; do
+                [[ -z "$orig_path" ]] && continue
+                sudo mkdir -p "$(dirname "$orig_path")"
+                # -p preserves the executable bit — some maps are executable "program maps"
+                sudo cp -p "$BUNDLE/autofs/maps/$safe_name" "$orig_path" 2>/dev/null \
+                    && ok "  Restored map: $orig_path" \
+                    || warn "Failed to restore map: $orig_path"
+            done < "$BUNDLE/autofs/map-file-list.txt"
+        fi
+        sudo systemctl enable --now autofs 2>/dev/null \
+            && { ok "autofs service enabled and started"; log_import "RESTORED: AutoFS"; } \
+            || warn "Could not enable/start autofs — run: sudo systemctl enable --now autofs"
+    else
+        info "[DRY RUN] would install autofs, restore /etc/auto.master + map files, and enable the service"
+    fi
+fi
+
 fi # end TUI/fallback
 
 # ── Non-TUI: auto-save summary to bundle folder ───────────────────────────────
@@ -3736,6 +3939,7 @@ echo ""
 echo -e "  ${YELLOW}Manual steps remaining:${RESET}"
 echo "    • Copy SSH private keys and chmod 600 ~/.ssh/id_*"
 echo "    • Verify NFS shares mounted  (fstab lines inserted; mount -a already run)"
+echo "    • Verify AutoFS mounts  (cd into an automount path to trigger a mount)"
 echo "    • tailscale up"
 echo "    • Re-pair Syncthing devices"
 echo "    • Enable GNOME extensions via Extensions app"

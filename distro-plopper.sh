@@ -500,10 +500,12 @@ fi
 
 # S2. Flatpak
 info "Scanning Flatpak..."
-touch "$SCAN_TMP/flatpak-apps.txt" "$SCAN_TMP/flatpak-full.txt" "$SCAN_TMP/flatpak-data-dirs.txt"
+touch "$SCAN_TMP/flatpak-apps.txt" "$SCAN_TMP/flatpak-full.txt" "$SCAN_TMP/flatpak-data-dirs.txt" \
+      "$SCAN_TMP/flatpak-scope.txt" "$SCAN_TMP/flatpak-remotes.txt" "$SCAN_TMP/flatpak-local-bundles.txt"
 if command -v flatpak &>/dev/null; then
     flatpak list --app --columns=application > "$SCAN_TMP/flatpak-apps.txt"
     flatpak list --app --columns=application,name,version,origin > "$SCAN_TMP/flatpak-full.txt"
+    flatpak list --app --columns=application,installation > "$SCAN_TMP/flatpak-scope.txt"
     SCAN_RESULTS[flatpak_count]=$(wc -l < "$SCAN_TMP/flatpak-apps.txt")
     while read -r app; do
         for subdir in config data cache; do
@@ -512,7 +514,31 @@ if command -v flatpak &>/dev/null; then
         done
     done < "$SCAN_TMP/flatpak-apps.txt"
     SCAN_RESULTS[flatpak_data_size]=$(du -sh "$HOME/.var/app" 2>/dev/null | awk '{print $1}' || echo "?")
+
+    # Flatpaks installed straight from a .flatpak bundle file (not from an
+    # online repo — e.g. an app not published on Flathub) get an auto-created
+    # "origin" remote that has no URL and is hidden from `flatpak remotes`.
+    # Those can't be reinstalled with `flatpak install <remote> <app>` on
+    # another machine — there's nothing to fetch — so they're bundled up as
+    # portable .flatpak files instead (see PHASE 3 below).
+    flatpak remotes --user --show-disabled --columns=name,url 2>/dev/null > "$SCAN_TMP/flatpak-remotes.txt" || true
+    flatpak remotes --system --show-disabled --columns=name,url 2>/dev/null >> "$SCAN_TMP/flatpak-remotes.txt" || true
+    declare -A _FP_REMOTE_URL=()
+    while IFS=$'\t' read -r _rn _rurl; do
+        [[ -n "$_rn" ]] && _FP_REMOTE_URL["$_rn"]="$_rurl"
+    done < "$SCAN_TMP/flatpak-remotes.txt"
+    while IFS=$'\t' read -r _aid _origin; do
+        [[ -z "$_aid" ]] && continue
+        if [[ -z "${_FP_REMOTE_URL[$_origin]:-}" ]]; then
+            _scope=$(awk -F'\t' -v a="$_aid" '$1==a{print $2}' "$SCAN_TMP/flatpak-scope.txt")
+            echo -e "${_aid}\t${_scope:-user}" >> "$SCAN_TMP/flatpak-local-bundles.txt"
+        fi
+    done < <(awk -F'\t' '{print $1"\t"$4}' "$SCAN_TMP/flatpak-full.txt")
+    unset _FP_REMOTE_URL
+    LOCAL_FP_COUNT=$(wc -l < "$SCAN_TMP/flatpak-local-bundles.txt")
+
     ok "Flatpak: ${SCAN_RESULTS[flatpak_count]} apps, ~/.var/app: ${SCAN_RESULTS[flatpak_data_size]}"
+    [[ "$LOCAL_FP_COUNT" -gt 0 ]] && ok "  ($LOCAL_FP_COUNT sideloaded from a local bundle, not a remote — will be exported as portable .flatpak files)"
     [[ "$SKIP_FLATPAK_DATA" == true ]] && warn "Flatpak data copy SKIPPED (--skip-flatpak-data)"
 else
     SCAN_RESULTS[flatpak_count]=0; SCAN_RESULTS[flatpak_data_size]="n/a"
@@ -811,9 +837,19 @@ if [[ -d /etc/turboprint ]] || [[ -d /usr/share/turboprint ]]; then
     TP_PROFILES=$(ls /usr/share/turboprint/profiles/ 2>/dev/null | wc -l || echo 0)
     echo "TP_PROFILES=$TP_PROFILES" >> "$SCAN_TMP/turboprint-info.txt"
 
-    # Check for license key
-    TP_KEY=$(find /etc/turboprint -name "*.tpkey" 2>/dev/null | head -1 || true)
+    # Check for a license key. TurboPrint converts the raw .tpkey you activate
+    # with into an encrypted /etc/turboprint/turboprint.ctf and doesn't keep the
+    # original around — so it's never actually in /etc/turboprint. Look for it
+    # wherever people keep downloaded license files instead (Desktop, Downloads,
+    # Documents, home dir), since re-activating on new/reinstalled hardware
+    # needs the original .tpkey, not the derived .ctf.
+    > "$SCAN_TMP/turboprint-license-keys.txt"
+    find /etc/turboprint "$HOME" -xdev -maxdepth 6 -iname "*.tpkey" 2>/dev/null \
+        | sort -u >> "$SCAN_TMP/turboprint-license-keys.txt" || true
+    TP_KEY=$(head -1 "$SCAN_TMP/turboprint-license-keys.txt")
+    TP_KEY_COUNT=$(wc -l < "$SCAN_TMP/turboprint-license-keys.txt")
     echo "TP_KEY=$TP_KEY" >> "$SCAN_TMP/turboprint-info.txt"
+    echo "TP_KEY_COUNT=$TP_KEY_COUNT" >> "$SCAN_TMP/turboprint-info.txt"
 
     # Custom page sizes live in the PPD files — extract them
     > "$SCAN_TMP/turboprint-custom-pagesizes.txt"
@@ -824,7 +860,13 @@ if [[ -d /etc/turboprint ]] || [[ -d /usr/share/turboprint ]]; then
     done
 
     ok "TurboPrint: $TP_QUEUES printer queue(s), $TP_PROFILES profile(s)"
-    [[ -n "$TP_KEY" ]] && ok "TurboPrint license key found: $TP_KEY"         || warn "TurboPrint: no .tpkey license file found in /etc/turboprint"
+    if [[ "$TP_KEY_COUNT" -gt 0 ]]; then
+        ok "TurboPrint license key found: $TP_KEY"
+        [[ "$TP_KEY_COUNT" -gt 1 ]] && ok "  ($TP_KEY_COUNT .tpkey files found total — all will be backed up)"
+    else
+        warn "TurboPrint: no .tpkey license file found anywhere under \$HOME or /etc/turboprint"
+        warn "  The active license is baked into /etc/turboprint/turboprint.ctf (still backed up), but re-activating on new/reinstalled hardware needs the original .tpkey"
+    fi
 else
     ok "TurboPrint: not installed (skipping)"
 fi
@@ -1233,7 +1275,7 @@ $(if [[ -f "$SCAN_TMP/turboprint-info.txt" ]] && grep -q "TP_FOUND=true" "$SCAN_
     echo "|------|--------|"
     echo "| Printer queues | $TP_QUEUES |"
     echo "| ICC profiles | $TP_PROFILES |"
-    echo "| License key | ${TP_KEY:-not found} |"
+    echo "| License key(s) | ${TP_KEY_COUNT:-0} found${TP_KEY:+ (e.g. \`$TP_KEY\`)} |"
     echo ""
     echo "### Custom Page Sizes"
     echo '\`\`\`'
@@ -1766,6 +1808,19 @@ section_md "1. Packages"
 cp "$SCAN_TMP/apps.txt"      "$OUTPUT_DIR/packages/" 2>/dev/null || true
 cp "$SCAN_TMP/cli-tools.txt" "$OUTPUT_DIR/packages/" 2>/dev/null || true
 cp "$SCAN_TMP"/flatpak-*.txt "$OUTPUT_DIR/packages/" 2>/dev/null || true
+if [[ -s "$SCAN_TMP/flatpak-local-bundles.txt" ]]; then
+    mkdir -p "$OUTPUT_DIR/flatpak/bundles"
+    while IFS=$'\t' read -r _laid _lscope; do
+        [[ -z "$_laid" ]] && continue
+        _lrepo="$HOME/.local/share/flatpak/repo"
+        [[ "$_lscope" == "system" ]] && _lrepo="/var/lib/flatpak/repo"
+        if flatpak build-bundle "$_lrepo" "$OUTPUT_DIR/flatpak/bundles/${_laid}.flatpak" "$_laid" &>>"$OUTPUT_DIR/flatpak-bundle-build.log"; then
+            ok "Bundled sideloaded Flatpak: $_laid"
+        else
+            warn "Could not create a portable bundle for sideloaded Flatpak $_laid — it won't be reinstallable on import (see flatpak-bundle-build.log)"
+        fi
+    done < "$SCAN_TMP/flatpak-local-bundles.txt"
+fi
 cp "$SCAN_TMP/appimages.txt"  "$OUTPUT_DIR/packages/" 2>/dev/null || true
 if [[ -s "$SCAN_TMP/appimage-portable.txt" ]]; then
     mkdir -p "$OUTPUT_DIR/packages/appimage-portable"
@@ -2283,7 +2338,24 @@ if [[ "$EXP_TURBOPRINT" == true ]] && [[ "${SCAN_RESULTS[tp_found]:-false}" == "
     section_md "15. TurboPrint"
     note_md "⚠️  Install TurboPrint on the new system FIRST, then restore these files."
     note_md "License key: re-run \`sudo tpsetup --install <keyfile>\` after copying."
-    mkdir -p "$OUTPUT_DIR/turboprint/"{config,profiles,ppd,user}
+    mkdir -p "$OUTPUT_DIR/turboprint/"{config,profiles,ppd,user,license}
+
+    # Original .tpkey license file(s) — not present in /etc/turboprint (TurboPrint
+    # consumes them into turboprint.ctf on activation), found instead wherever the
+    # user kept the downloaded key. Needed to re-activate on new/reinstalled hardware.
+    if [[ -s "$SCAN_TMP/turboprint-license-keys.txt" ]]; then
+        while IFS= read -r _tpkey; do
+            [[ -f "$_tpkey" ]] && cp -n "$_tpkey" "$OUTPUT_DIR/turboprint/license/" 2>/dev/null || true
+        done < "$SCAN_TMP/turboprint-license-keys.txt"
+        TPKEY_BACKED_UP=$(ls "$OUTPUT_DIR/turboprint/license/" 2>/dev/null | wc -l)
+        ok "TurboPrint: $TPKEY_BACKED_UP license key file(s) backed up"
+        log_md "### License Key Files"
+        log_md '```'
+        cat "$SCAN_TMP/turboprint-license-keys.txt" >> "$MD"
+        log_md '```'
+    else
+        warn "TurboPrint: no .tpkey found anywhere to back up — the active license is still in config/turboprint.ctf, but you'll need the original key to re-activate on different hardware"
+    fi
 
     # /etc/turboprint — main config + license key
     if [[ -d /etc/turboprint ]]; then
@@ -2336,7 +2408,7 @@ if [[ "$EXP_TURBOPRINT" == true ]] && [[ "${SCAN_RESULTS[tp_found]:-false}" == "
     log_md "4. \`sudo cp -r turboprint/profiles/. /usr/share/turboprint/profiles/\`"
     log_md "5. \`cp turboprint/user/dot-turboprint ~/.turboprint\`"
     log_md "6. \`sudo systemctl restart cups\`"
-    log_md "7. Re-run \`sudo tpsetup --install <keyfile>\` if needed"
+    log_md "7. If the license doesn't carry over (e.g. new/reinstalled hardware), re-activate with \`sudo tpsetup --install turboprint/license/<keyfile>.tpkey\`"
 fi
 
 # ── Cron ──────────────────────────────────────────────────────────────────────
@@ -2408,7 +2480,7 @@ cat >> "$MD" << 'CHECKLIST'
 - [ ] `sudo cp -r turboprint/profiles/. /usr/share/turboprint/profiles/`
 - [ ] `cp turboprint/user/dot-turboprint ~/.turboprint`
 - [ ] `sudo systemctl restart cups`
-- [ ] Verify license: `sudo tpsetup --install /etc/turboprint/<keyfile>.tpkey`
+- [ ] If the license doesn't carry over: `sudo tpsetup --install turboprint/license/<keyfile>.tpkey`
 
 ### Final
 - [ ] Reboot
@@ -2659,6 +2731,69 @@ do_large_copy() {
     fi
 }
 
+# Installs the given Flatpak app IDs from $BUNDLE. Handles three cases:
+#  - normal apps from a real remote (flathub, fedora, or a custom repo with
+#    a URL) — the remote is added if the target doesn't have it yet
+#  - apps sideloaded from a local .flatpak bundle file with no reachable
+#    remote (e.g. an app not published anywhere) — reinstalled from the
+#    portable .flatpak file exported into $BUNDLE/flatpak/bundles/
+# Takes the array of app IDs to install by name (nameref).
+install_flatpak_apps() {
+    local -n _fp_apps="$1"
+    [[ "${#_fp_apps[@]}" -eq 0 ]] && return 0
+
+    local _aid _n _v _ori _sc _rn _rurl _rem _app _fp_known
+    local -A _fp_rmap=() _fp_scope=() _fp_local=()
+    [[ -f "$BUNDLE/packages/flatpak-full.txt" ]] && while IFS=$'\t' read -r _aid _n _v _ori; do
+        _fp_rmap["$_aid"]="${_ori:-flathub}"
+    done < "$BUNDLE/packages/flatpak-full.txt"
+    [[ -f "$BUNDLE/packages/flatpak-scope.txt" ]] && while IFS=$'\t' read -r _aid _sc; do
+        _fp_scope["$_aid"]="$_sc"
+    done < "$BUNDLE/packages/flatpak-scope.txt"
+    [[ -f "$BUNDLE/packages/flatpak-local-bundles.txt" ]] && while IFS=$'\t' read -r _aid _sc; do
+        _fp_local["$_aid"]=1
+    done < "$BUNDLE/packages/flatpak-local-bundles.txt"
+
+    # Re-add any missing custom remotes that have a real, fetchable URL.
+    if [[ -f "$BUNDLE/packages/flatpak-remotes.txt" ]]; then
+        _fp_known=$(flatpak remotes --columns=name 2>/dev/null || true)
+        while IFS=$'\t' read -r _rn _rurl; do
+            [[ -z "$_rn" || -z "$_rurl" ]] && continue
+            grep -qx "$_rn" <<< "$_fp_known" && continue
+            flatpak remote-add --if-not-exists "$_rn" "$_rurl" 2>&1 | tee -a "$IMPORT_LOG" || true
+        done < "$BUNDLE/packages/flatpak-remotes.txt"
+    fi
+
+    local _fp_ok=true
+    local -A _fp_byremote=()
+    for _app in "${_fp_apps[@]}"; do
+        if [[ -n "${_fp_local[$_app]:-}" ]]; then
+            local _fp_bundlefile="$BUNDLE/flatpak/bundles/${_app}.flatpak"
+            local _fp_scflag="--user"; [[ "${_fp_scope[$_app]:-}" == "system" ]] && _fp_scflag="--system"
+            if [[ -f "$_fp_bundlefile" ]]; then
+                if flatpak info $_fp_scflag "$_app" &>/dev/null; then
+                    info "  $_app already installed — skipping (re-run \`flatpak update $_fp_scflag $_app\` manually to update from the bundle)"
+                else
+                    flatpak install --noninteractive $_fp_scflag "$_fp_bundlefile" 2>&1 | tee -a "$IMPORT_LOG" \
+                        || { warn "Failed to install sideloaded app $_app"; _fp_ok=false; }
+                fi
+            else
+                warn "No portable bundle found for sideloaded app $_app (was it exported before this feature existed?) — skipping"
+                _fp_ok=false
+            fi
+        else
+            _rem="${_fp_rmap[$_app]:-flathub}"
+            _fp_byremote["$_rem"]+=" $_app"
+        fi
+    done
+    for _rem in "${!_fp_byremote[@]}"; do
+        read -ra _grp <<< "${_fp_byremote[$_rem]}"
+        flatpak install --noninteractive --or-update "$_rem" "${_grp[@]}" 2>&1 | tee -a "$IMPORT_LOG" \
+            || { warn "Some Flatpak apps from $_rem failed"; _fp_ok=false; }
+    done
+    [[ "$_fp_ok" == true ]] && ok "Flatpak apps done" || warn "Some Flatpak apps may not have installed — check log above"
+}
+
 # System-wide keyboard layout (console + X11/Wayland) — distinct from GNOME's
 # per-user dconf keyboard settings, which are restored separately via dconf load.
 restore_keyboard_layout() {
@@ -2899,10 +3034,10 @@ if [[ "$TP_IN_BUNDLE" == "yes" ]]; then
     PREFLIGHT_MSG+="□  Install it: sudo ./setup  (TGZ) or  sudo dpkg -i *.deb\n"
     PREFLIGHT_MSG+="□  Have your .tpkey license file accessible\n"
     PREFLIGHT_MSG+="□  Your printer is connected and powered on\n"
-    if [[ -f "$BUNDLE/turboprint/config/"*.tpkey ]] 2>/dev/null; then
+    if [[ -d "$BUNDLE/turboprint/license" ]] && [[ -n "$(ls -A "$BUNDLE/turboprint/license" 2>/dev/null)" ]]; then
         PREFLIGHT_MSG+="✓  License key found in bundle\n"
     else
-        PREFLIGHT_MSG+="□  ⚠ No .tpkey found in bundle — locate your key file\n"
+        PREFLIGHT_MSG+="□  ⚠ No .tpkey found in bundle — the config/turboprint.ctf may still work if this is the same hardware; otherwise locate your key file\n"
     fi
 fi
 
@@ -3290,24 +3425,7 @@ Add these PPAs now? (requires internet connection)" \
     if [[ "${#SELECTED_FLATPAK[@]}" -gt 0 ]]; then
         echo ""
         header "Installing Flatpak apps (${#SELECTED_FLATPAK[@]})..."
-        # Build app→remote map from bundle's recorded origins
-        declare -A _FP_RMAP=()
-        [[ -f "$BUNDLE/packages/flatpak-full.txt" ]] && while IFS=$'\t' read -r _aid _n _v _ori; do
-            _FP_RMAP["$_aid"]="${_ori:-flathub}"
-        done < "$BUNDLE/packages/flatpak-full.txt"
-        # Group selected apps by their source remote and install each group
-        declare -A _FP_BREM=()
-        for _app in "${SELECTED_FLATPAK[@]}"; do
-            _rem="${_FP_RMAP[$_app]:-flathub}"
-            _FP_BREM["$_rem"]+=" $_app"
-        done
-        _FP_ALL_OK=true
-        for _rem in "${!_FP_BREM[@]}"; do
-            read -ra _apps <<< "${_FP_BREM[$_rem]}"
-            flatpak install --noninteractive --or-update "$_rem" "${_apps[@]}" 2>&1 | tee -a "$IMPORT_LOG" \
-                || { warn "Some Flatpak apps from $_rem failed"; _FP_ALL_OK=false; }
-        done
-        [[ "$_FP_ALL_OK" == true ]] && ok "Flatpak apps done" || warn "Some Flatpak apps may not have installed — check log above"
+        install_flatpak_apps SELECTED_FLATPAK
         info "  Log out and back in for Flatpak apps to appear in your launcher"
         add_manual "Log out and back in (or reboot) for Flatpak apps to appear in your launcher"
     fi
@@ -3379,7 +3497,7 @@ The bundle will still be here when you come back."               $BOX_H $BOX_W |
   • Printer configs:  $(ls "$BUNDLE/turboprint/config/" 2>/dev/null | wc -l) files
   • CUPS PPD files:   $(ls "$BUNDLE/turboprint/ppd/" 2>/dev/null | wc -l) printer queue(s)
   • ICC profiles:     $(ls "$BUNDLE/turboprint/profiles/" 2>/dev/null | wc -l) profiles
-  • License key:      $( find "$BUNDLE/turboprint/config" -name "*.tpkey" 2>/dev/null | head -1 | xargs basename 2>/dev/null || echo "not found" )
+  • License key:      $( find "$BUNDLE/turboprint/license" -name "*.tpkey" 2>/dev/null | head -1 | xargs -r basename || echo "not found (config/turboprint.ctf may still work if this is the same hardware)" )
   • User settings:    $( [[ -f "$BUNDLE/turboprint/user/dot-turboprint" ]] && echo "yes" || echo "no" )
 
 Restore TurboPrint configuration now?"               $BOX_H $BOX_W && _DO_TP_RESTORE=true || _DO_TP_RESTORE=false
@@ -3398,21 +3516,24 @@ Restore TurboPrint configuration now?"               $BOX_H $BOX_W && _DO_TP_RES
                 log_import "RESTORED: TurboPrint"
                 add_manual "TurboPrint: if printer port is wrong, open xtpsetup → Edit → re-select port"
 
-                TPKEY_FOUND=$(find /etc/turboprint -name "*.tpkey" 2>/dev/null | head -1 || true)
+                TPKEY_FOUND=$(find "$BUNDLE/turboprint/license" -name "*.tpkey" 2>/dev/null | head -1 || true)
                 whiptail --title "TurboPrint — License"                   --msgbox "TurboPrint config restored and CUPS restarted.
 
+The license baked into config/turboprint.ctf carried over and should just
+work if this is the same physical hardware as the original machine.
+
 License key status:
-  $( [[ -n "$TPKEY_FOUND" ]] && echo "✅ Key found: $(basename "$TPKEY_FOUND")" || echo "⚠️  No .tpkey found — locate and run:" )
-  $( [[ -z "$TPKEY_FOUND" ]] && echo "  sudo tpsetup --install <keyfile>.tpkey" || true )
+  $( [[ -n "$TPKEY_FOUND" ]] && echo "✅ Original key backed up: $TPKEY_FOUND" || echo "⚠️  No .tpkey backed up — locate your key file" )
+  If printouts show a watermark (license didn't carry over — e.g. new
+  hardware), re-activate with:
+  $( [[ -n "$TPKEY_FOUND" ]] && echo "  sudo tpsetup --install \"$TPKEY_FOUND\"" || echo "  sudo tpsetup --install <keyfile>.tpkey" )
 
 Verify printer queues:
   xtpsetup        (GUI)
   tpsetup --list  (command line)
 
 ⚠️  If the printer port is wrong (common after migration):
-  Open xtpsetup → Edit → re-select the port from the list.
-
-If printouts show a watermark, the license needs re-applying."                   $BOX_H $BOX_W || true
+  Open xtpsetup → Edit → re-select the port from the list."                   $BOX_H $BOX_W || true
             fi
         fi
     else
@@ -3434,7 +3555,14 @@ If printouts show a watermark, the license needs re-applying."                  
             else
                 info "[DRY RUN] would restore TurboPrint"
             fi
-            warn "Verify license: sudo tpsetup --install /etc/turboprint/<keyfile>.tpkey"
+            _TPKEY_FOUND=$(find "$BUNDLE/turboprint/license" -name "*.tpkey" 2>/dev/null | head -1 || true)
+            if [[ -n "$_TPKEY_FOUND" ]]; then
+                info "  License key backed up at: $_TPKEY_FOUND"
+                info "  Config/turboprint.ctf should already work if this is the same hardware — if printouts show a watermark, re-activate with:"
+                info "    sudo tpsetup --install \"$_TPKEY_FOUND\""
+            else
+                warn "No .tpkey backed up — if printouts show a watermark, locate your key file and run: sudo tpsetup --install <keyfile>.tpkey"
+            fi
         else
             warn "TurboPrint not installed — skipping config restore. Install first and re-run."
         fi
@@ -4008,22 +4136,8 @@ if [[ "$IMP_NO_PACKAGES" == false ]]; then
         step "Flatpak apps ($FLATPAK_COUNT)..."
         if command -v flatpak &>/dev/null; then
             if [[ "$DRY_RUN" == false ]]; then
-                # Build app→remote map then install each remote's apps as a group
-                declare -A _FP_RMAP=()
-                [[ -f "$BUNDLE/packages/flatpak-full.txt" ]] && while IFS=$'\t' read -r _aid _n _v _ori; do
-                    _FP_RMAP["$_aid"]="${_ori:-flathub}"
-                done < "$BUNDLE/packages/flatpak-full.txt"
-                declare -A _FP_BREM=()
-                while read -r _app; do
-                    [[ -z "$_app" ]] && continue
-                    _rem="${_FP_RMAP[$_app]:-flathub}"
-                    _FP_BREM["$_rem"]+=" $_app"
-                done < "$BUNDLE/packages/flatpak-apps.txt"
-                for _rem in "${!_FP_BREM[@]}"; do
-                    read -ra _apps <<< "${_FP_BREM[$_rem]}"
-                    flatpak install --noninteractive --or-update "$_rem" "${_apps[@]}" 2>&1 | tee -a "$IMPORT_LOG" \
-                        || warn "Some Flatpak apps from $_rem failed"
-                done
+                mapfile -t _ALL_FLATPAK_APPS < "$BUNDLE/packages/flatpak-apps.txt"
+                install_flatpak_apps _ALL_FLATPAK_APPS
                 info "  Log out and back in for Flatpak apps to appear in your launcher"
                 add_manual "Log out and back in (or reboot) for Flatpak apps to appear in your launcher"
             else

@@ -54,6 +54,13 @@
 #   --skip-steam          Skip all Steam data
 #   --skip-homedirs       Skip XDG home directories (Documents, Downloads, etc.)
 #   --skip-userhomes      Skip /home/* user directory export
+#   --include-containers-bottles
+#                         Include Bottles wine-prefix content (drive_c, installed
+#                         programs) and container storage (~/.local/share/
+#                         containers/storage — podman/distrobox/toolbx layers).
+#                         Excluded by default — often huge and prone to
+#                         permission errors. Bottles' own config/settings and
+#                         small container metadata are always backed up.
 #   --no-archive          Skip .tar.gz creation (bundle directory only)
 #   --output DIR          Output directory (default: ~/distro-plopper-TIMESTAMP)
 #
@@ -236,6 +243,15 @@ SKIP_FLATPAK_DATA=false
 SKIP_STEAM=false
 SKIP_HOMEDIRS=false
 SKIP_USERHOMES=false
+# Bottles wine-prefix content and container storage layers are frequently
+# multi-GB and riddled with permission errors on copy (rootless podman uid
+# mapping, wine junctions/symlinks). Excluded by default; opt in with
+# --include-containers-bottles. Only the bulky *content* is excluded — Bottles'
+# own config/settings and small container metadata are still backed up.
+EXCLUDE_CONTAINERS_BOTTLES=true
+BOTTLES_APP_ID="com.usebottles.bottles"
+BOTTLES_PREFIXES_SUBPATH="data/bottles/bottles"   # the actual wineprefixes: drive_c, dosdevices, registry
+CONTAINERS_STORAGE_DIR="$HOME/.local/share/containers/storage"  # podman/distrobox/toolbx overlay layers & rootfs
 # Initialised here so they are always bound regardless of TUI/non-TUI path
 ARCHIVE=""
 ARCHIVE_CHOICE="yes"
@@ -290,6 +306,7 @@ while [[ $# -gt 0 ]]; do
         --skip-steam)        SKIP_STEAM=true ;;
         --skip-homedirs)     SKIP_HOMEDIRS=true ;;
         --skip-userhomes)    SKIP_USERHOMES=true ;;
+        --include-containers-bottles) EXCLUDE_CONTAINERS_BOTTLES=false ;;
         --no-archive)        ARCHIVE_CHOICE="no" ;;
         --output)            OUTPUT_DIR="$2"; IMPORT_OUTPUT_DIR="$2"; shift ;;
         # import options
@@ -490,6 +507,22 @@ if command -v flatpak &>/dev/null; then
 else
     SCAN_RESULTS[flatpak_count]=0; SCAN_RESULTS[flatpak_data_size]="n/a"
     warn "Flatpak not installed"
+fi
+
+# Bottles wine-prefix content (drive_c, dosdevices, registry — NOT Bottles' own
+# config/settings) and container storage layers (podman/distrobox/toolbx backing
+# store, regardless of the container's own distro/package manager) — these are
+# the bulky, permission-error-prone parts. Excluded from export by default;
+# see --include-containers-bottles.
+BOTTLES_PREFIXES_DIR="$HOME/.var/app/$BOTTLES_APP_ID/$BOTTLES_PREFIXES_SUBPATH"
+HEAVY_DATA_PATHS=()
+[[ -d "$BOTTLES_PREFIXES_DIR" ]]  && HEAVY_DATA_PATHS+=("$BOTTLES_PREFIXES_DIR")
+[[ -d "$CONTAINERS_STORAGE_DIR" ]] && HEAVY_DATA_PATHS+=("$CONTAINERS_STORAGE_DIR")
+if [[ ${#HEAVY_DATA_PATHS[@]} -gt 0 ]]; then
+    SCAN_RESULTS[heavy_data_size]=$(du -sch "${HEAVY_DATA_PATHS[@]}" 2>/dev/null | tail -1 | awk '{print $1}' || echo "?")
+    ok "Bottles wine-prefix content / container storage found: ${SCAN_RESULTS[heavy_data_size]} (excluded by default — see --include-containers-bottles)"
+else
+    SCAN_RESULTS[heavy_data_size]="0"
 fi
 
 # S3. AppImages
@@ -1344,6 +1377,11 @@ FLAT_LABEL="Flatpak app data — ~/.var/app (${SCAN_RESULTS[flatpak_data_size]:-
     && EXP_OPTS+=("flatpakdata" "$FLAT_LABEL" "ON") \
     || EXP_OPTS+=("flatpakdata" "$FLAT_LABEL [not found]" "OFF")
 
+# Bottles wine-prefix content / container storage — large & permission-heavy, OFF by default
+if [[ "${SCAN_RESULTS[heavy_data_size]:-0}" != "0" ]]; then
+    EXP_OPTS+=("containersbottles" "Bottles wine-prefix content & container storage — drive_c/installed programs, ~/.local/share/containers/storage (~${SCAN_RESULTS[heavy_data_size]}) — large, often permission errors" "$( [[ "$EXCLUDE_CONTAINERS_BOTTLES" == false ]] && echo ON || echo OFF )")
+fi
+
 # Browsers — show each one found
 if [[ -s "$SCAN_TMP/browser-profiles.txt" ]]; then
     BROWSER_LIST=$(cut -d'|' -f1 "$SCAN_TMP/browser-profiles.txt" | tr '\n' ', ' | sed 's/,$//')
@@ -1415,11 +1453,16 @@ EXP_STEAM=false;       [[ "$EXPORT_CHOICES" == *'"steam"'*       ]] && EXP_STEAM
 EXP_TURBOPRINT=false;  [[ "$EXPORT_CHOICES" == *'"turboprint"'*  ]] && EXP_TURBOPRINT=true
 EXP_CUPS=false;        [[ "$EXPORT_CHOICES" == *'"cups"'*         ]] && EXP_CUPS=true
 EXP_DISPLAYCAL=false;  [[ "$EXPORT_CHOICES" == *'"displaycal"'*   ]] && EXP_DISPLAYCAL=true
+EXP_CONTAINERSBOTTLES=false; [[ "$EXPORT_CHOICES" == *'"containersbottles"'* ]] && EXP_CONTAINERSBOTTLES=true
 
 # Override CLI flags with TUI selections
 [[ "$EXP_FLATPAKDATA" == false ]] && SKIP_FLATPAK_DATA=true  || SKIP_FLATPAK_DATA=false
 [[ "$EXP_BROWSERS"    == false ]] && SKIP_BROWSERS=true      || SKIP_BROWSERS=false
 [[ "$EXP_STEAM"       == false ]] && SKIP_STEAM=true         || SKIP_STEAM=false
+# Only let the TUI override the exclusion when the item was actually shown
+# (i.e. something heavy was found) — otherwise keep the CLI/default value.
+[[ "${SCAN_RESULTS[heavy_data_size]:-0}" != "0" ]] && \
+    { [[ "$EXP_CONTAINERSBOTTLES" == true ]] && EXCLUDE_CONTAINERS_BOTTLES=false || EXCLUDE_CONTAINERS_BOTTLES=true; }
 
 # ── Home directories sub-selection ───────────────────────────────────────────
 > "$SCAN_TMP/home-dirs-selected.txt"
@@ -1734,6 +1777,16 @@ while read -r dir; do
     for s in "${SKIP_LOCAL[@]}"; do [[ "$NAME" == "$s" ]] && SKIP=true && break; done
     if [[ "$SKIP" == true ]]; then
         log_md "| \`$NAME\` | $SIZE | ⬜ excluded |"
+    elif [[ "$NAME" == "containers" ]] && [[ "$EXCLUDE_CONTAINERS_BOTTLES" == true ]] && [[ -d "$dir/storage" ]]; then
+        # Keep small container metadata, exclude the bulky overlay storage/rootfs layers
+        mkdir -p "$OUTPUT_DIR/configs/local-share/containers"
+        if command -v rsync &>/dev/null; then
+            rsync -a --exclude='storage/' "$dir/" "$OUTPUT_DIR/configs/local-share/containers/" 2>/dev/null || true
+        else
+            cp -r "$dir/." "$OUTPUT_DIR/configs/local-share/containers/" 2>/dev/null || true
+            rm -rf "$OUTPUT_DIR/configs/local-share/containers/storage"
+        fi
+        log_md "| \`$NAME\` | $SIZE | ⚠️ partial (storage/ excluded) |"
     else
         # Use spinner for dirs over 100MB
         if [[ "$DIR_BYTES" -gt 104857600 ]]; then
@@ -1744,6 +1797,9 @@ while read -r dir; do
         log_md "| \`$NAME\` | $SIZE | ✅ |"
     fi
 done < "$SCAN_TMP/local-share-dirs.txt"
+if [[ "$EXCLUDE_CONTAINERS_BOTTLES" == true ]] && [[ -d "$CONTAINERS_STORAGE_DIR" ]]; then
+    warn "~/.local/share/containers/storage (podman/distrobox/toolbx layers) excluded by default — use --include-containers-bottles to include"
+fi
 # Shotwell thumbnail cache is large and regenerated automatically — strip it from the bundle
 if [[ -d "$OUTPUT_DIR/configs/local-share/shotwell/thumbs" ]]; then
     rm -rf "$OUTPUT_DIR/configs/local-share/shotwell/thumbs"
@@ -1804,11 +1860,31 @@ fi # EXP_STEAM
 if [[ "$EXP_FLATPAKDATA" == true ]]; then
 section_md "5. Flatpak App Data (~/.var/app)"
 if [[ "$SKIP_FLATPAK_DATA" == false ]] && [[ -d "$HOME/.var/app" ]]; then
-    copy_with_spinner "Flatpak ~/.var/app (${SCAN_RESULTS[flatpak_data_size]:-?})" "$HOME/.var/app" "$OUTPUT_DIR/flatpak/var-app"
-    ACTUAL=$(du -sh "$OUTPUT_DIR/flatpak/var-app" 2>/dev/null | tail -1 | awk '{print $1}' || echo "?")
-    log_md "Backed up: $ACTUAL"
-    echo "flatpak_data_present=true" >> "$MANIFEST"
-    ok "Flatpak ~/.var/app copied ($ACTUAL)"
+    EXCLUDE_BOTTLES_PREFIXES=false
+    [[ "$EXCLUDE_CONTAINERS_BOTTLES" == true ]] && [[ -d "$BOTTLES_PREFIXES_DIR" ]] && EXCLUDE_BOTTLES_PREFIXES=true
+    if [[ "$EXCLUDE_BOTTLES_PREFIXES" == true ]]; then
+        mkdir -p "$OUTPUT_DIR/flatpak/var-app"
+        info "Copying Flatpak app data (excluding Bottles wine-prefix content: $BOTTLES_APP_ID/$BOTTLES_PREFIXES_SUBPATH)..."
+        if command -v rsync &>/dev/null; then
+            rsync -a --exclude="$BOTTLES_APP_ID/$BOTTLES_PREFIXES_SUBPATH/" "$HOME/.var/app/" "$OUTPUT_DIR/flatpak/var-app/" 2>/dev/null || true
+        else
+            cp -r "$HOME/.var/app/." "$OUTPUT_DIR/flatpak/var-app/" 2>/dev/null || true
+            rm -rf "${OUTPUT_DIR:?}/flatpak/var-app/$BOTTLES_APP_ID/$BOTTLES_PREFIXES_SUBPATH"
+        fi
+        ACTUAL=$(du -sh "$OUTPUT_DIR/flatpak/var-app" 2>/dev/null | tail -1 | awk '{print $1}' || echo "?")
+        log_md "Backed up: $ACTUAL"
+        log_md "> ⚠️  Excluded (large/permission-heavy): \`$BOTTLES_APP_ID/$BOTTLES_PREFIXES_SUBPATH\` (Bottles wine-prefix content — drive_c, installed programs) — Bottles' own config/settings were kept. Re-run with \`--include-containers-bottles\` to include."
+        echo "flatpak_data_present=true" >> "$MANIFEST"
+        ok "Flatpak ~/.var/app copied ($ACTUAL, Bottles wine-prefix content excluded)"
+    else
+        # NOTE: source must end in "/." so cp copies var/app's *contents* (app IDs)
+        # directly into var-app/, matching what restore expects (var-app/<appid>/...).
+        copy_with_spinner "Flatpak ~/.var/app (${SCAN_RESULTS[flatpak_data_size]:-?})" "$HOME/.var/app/." "$OUTPUT_DIR/flatpak/var-app"
+        ACTUAL=$(du -sh "$OUTPUT_DIR/flatpak/var-app" 2>/dev/null | tail -1 | awk '{print $1}' || echo "?")
+        log_md "Backed up: $ACTUAL"
+        echo "flatpak_data_present=true" >> "$MANIFEST"
+        ok "Flatpak ~/.var/app copied ($ACTUAL)"
+    fi
 else
     log_md "_Skipped._"
     echo "flatpak_data_present=false" >> "$MANIFEST"
@@ -1819,6 +1895,9 @@ while read -r appid; do
     C="$( [[ -d "$BASE/config" ]] && echo "✅" || echo "⬜" )"
     D="$( [[ -d "$BASE/data" ]]   && echo "✅" || echo "⬜" )"
     A="$( [[ -d "$BASE/cache" ]]  && echo "✅" || echo "⬜" )"
+    if [[ "$appid" == "$BOTTLES_APP_ID" ]] && [[ "${EXCLUDE_BOTTLES_PREFIXES:-false}" == true ]]; then
+        D="⚠️ partial"
+    fi
     log_md "| \`$appid\` | $C | $D | $A |"
 done < "$SCAN_TMP/flatpak-apps.txt"
 fi # EXP_FLATPAKDATA

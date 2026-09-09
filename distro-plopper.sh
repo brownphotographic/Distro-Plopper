@@ -627,15 +627,21 @@ ok "NFS: exports=$NFS_EXPORTS, fstab mounts=$NFS_MOUNTS"
 
 # S10b. AutoFS
 info "Scanning autofs..."
+# Some builds (e.g. the Arch/AUR "autofs" package) use /etc/autofs/ as the
+# config root instead of the traditional Fedora/Debian/SUSE /etc/ layout —
+# detect which one is actually in use rather than assuming /etc/auto.master.
+AUTOFS_MASTER="/etc/auto.master"; AUTOFS_MASTER_D="/etc/auto.master.d"
+[[ -f /etc/autofs/auto.master ]] && AUTOFS_MASTER="/etc/autofs/auto.master"
+[[ -d /etc/autofs/auto.master.d ]] && AUTOFS_MASTER_D="/etc/autofs/auto.master.d"
 AUTOFS_CONFIGURED=false; AUTOFS_ENABLED=false
-[[ -f /etc/auto.master ]] && grep -qvE '^#|^$' /etc/auto.master 2>/dev/null && AUTOFS_CONFIGURED=true
-[[ -d /etc/auto.master.d ]] && [[ -n "$(find /etc/auto.master.d -maxdepth 1 -type f 2>/dev/null)" ]] && AUTOFS_CONFIGURED=true
+[[ -f "$AUTOFS_MASTER" ]] && grep -qvE '^#|^$' "$AUTOFS_MASTER" 2>/dev/null && AUTOFS_CONFIGURED=true
+[[ -d "$AUTOFS_MASTER_D" ]] && [[ -n "$(find "$AUTOFS_MASTER_D" -maxdepth 1 -type f 2>/dev/null)" ]] && AUTOFS_CONFIGURED=true
 systemctl is-enabled autofs &>/dev/null && AUTOFS_ENABLED=true
 # Collect map file paths referenced by the master map (skip +include directives
 # and non-file map types like ldap:/yp: — those can't be exported as files)
 > "$SCAN_TMP/autofs-maps-resolved.txt"
-{ [[ -f /etc/auto.master ]] && grep -vE '^#|^$' /etc/auto.master 2>/dev/null | awk '{print $2}'
-  for f in /etc/auto.master.d/*; do
+{ [[ -f "$AUTOFS_MASTER" ]] && grep -vE '^#|^$' "$AUTOFS_MASTER" 2>/dev/null | awk '{print $2}'
+  for f in "$AUTOFS_MASTER_D"/*; do
       [[ -f "$f" ]] && grep -vE '^#|^$' "$f" 2>/dev/null | awk '{print $2}'
   done
 } 2>/dev/null | sed 's/^file://' | while IFS= read -r m; do
@@ -1879,10 +1885,10 @@ fi # EXP_NFS
 # ── AutoFS ────────────────────────────────────────────────────────────────────
 if [[ "$EXP_AUTOFS" == true ]]; then
 section_md "8b. AutoFS"
-[[ -f /etc/auto.master ]] && cp -p /etc/auto.master "$OUTPUT_DIR/autofs/" 2>/dev/null || true
-if [[ -d /etc/auto.master.d ]] && [[ -n "$(find /etc/auto.master.d -maxdepth 1 -type f 2>/dev/null)" ]]; then
+[[ -f "$AUTOFS_MASTER" ]] && cp -p "$AUTOFS_MASTER" "$OUTPUT_DIR/autofs/auto.master" 2>/dev/null || true
+if [[ -d "$AUTOFS_MASTER_D" ]] && [[ -n "$(find "$AUTOFS_MASTER_D" -maxdepth 1 -type f 2>/dev/null)" ]]; then
     mkdir -p "$OUTPUT_DIR/autofs/auto.master.d"
-    cp -p /etc/auto.master.d/* "$OUTPUT_DIR/autofs/auto.master.d/" 2>/dev/null || true
+    cp -p "$AUTOFS_MASTER_D"/* "$OUTPUT_DIR/autofs/auto.master.d/" 2>/dev/null || true
 fi
 > "$OUTPUT_DIR/autofs/map-file-list.txt"
 if [[ -s "$SCAN_TMP/autofs-maps-resolved.txt" ]]; then
@@ -1897,8 +1903,8 @@ if [[ -s "$SCAN_TMP/autofs-maps-resolved.txt" ]]; then
 fi
 echo "autofs_configured=${SCAN_RESULTS[autofs_configured]:-false}" >> "$MANIFEST"
 echo "autofs_enabled=${SCAN_RESULTS[autofs_enabled]:-false}" >> "$MANIFEST"
-log_md "### /etc/auto.master"; log_md '```'
-[[ -f /etc/auto.master ]] && cat /etc/auto.master >> "$MD" || log_md "(not found)"
+log_md "### $AUTOFS_MASTER"; log_md '```'
+[[ -f "$AUTOFS_MASTER" ]] && cat "$AUTOFS_MASTER" >> "$MD" || log_md "(not found)"
 log_md '```'
 log_md "### Map files backed up"; log_md '```'
 cat "$SCAN_TMP/autofs-maps-resolved.txt" 2>/dev/null >> "$MD" || log_md "(none)"
@@ -3459,8 +3465,21 @@ AUTOFS_MSG=""
 if [[ "$HAS_AUTOFS" == true ]]; then
     if [[ "$DRY_RUN" == false ]]; then
         if ! systemctl list-unit-files autofs.service &>/dev/null && ! command -v automount &>/dev/null; then
+            _AUTOFS_AUR_HELPER=""
+            command -v yay  &>/dev/null && _AUTOFS_AUR_HELPER="yay"
+            command -v paru &>/dev/null && _AUTOFS_AUR_HELPER="paru"
             case "$PKG_FAMILY" in
-                arch)   sudo pacman -S --needed --noconfirm autofs 2>/dev/null && AUTOFS_MSG+="✓ autofs package installed\n" || AUTOFS_MSG+="⚠ autofs install failed — install manually\n" ;;
+                arch)
+                    if sudo pacman -S --needed --noconfirm autofs 2>/dev/null; then
+                        AUTOFS_MSG+="✓ autofs package installed\n"
+                    elif [[ -n "$_AUTOFS_AUR_HELPER" ]] && $_AUTOFS_AUR_HELPER -S --needed --noconfirm autofs 2>/dev/null; then
+                        AUTOFS_MSG+="✓ autofs package installed (via $_AUTOFS_AUR_HELPER, AUR)\n"
+                    elif [[ -z "$_AUTOFS_AUR_HELPER" ]]; then
+                        AUTOFS_MSG+="⚠ autofs is AUR-only on Arch and no AUR helper (yay/paru) was found — install one, then run: yay -S autofs\n"
+                    else
+                        AUTOFS_MSG+="⚠ autofs install failed via pacman and $_AUTOFS_AUR_HELPER — install manually\n"
+                    fi
+                    ;;
                 fedora) sudo dnf install -y autofs 2>/dev/null && AUTOFS_MSG+="✓ autofs package installed\n" || AUTOFS_MSG+="⚠ autofs install failed — install manually\n" ;;
                 debian) sudo apt install -y autofs 2>/dev/null && AUTOFS_MSG+="✓ autofs package installed\n" || AUTOFS_MSG+="⚠ autofs install failed — install manually\n" ;;
                 suse)   sudo zypper install -y autofs 2>/dev/null && AUTOFS_MSG+="✓ autofs package installed\n" || AUTOFS_MSG+="⚠ autofs install failed — install manually\n" ;;
@@ -3469,28 +3488,34 @@ if [[ "$HAS_AUTOFS" == true ]]; then
         else
             AUTOFS_MSG+="✓ autofs already installed\n"
         fi
+        # Some builds (e.g. the Arch/AUR "autofs" package) use /etc/autofs/ as
+        # the config root instead of the traditional /etc/ layout — detect
+        # which one this installed daemon actually reads, now that it's
+        # installed, rather than assuming /etc/auto.master.
+        AUTOFS_MASTER="/etc/auto.master"; AUTOFS_MASTER_D="/etc/auto.master.d"
+        [[ -d /etc/autofs ]] && AUTOFS_MASTER="/etc/autofs/auto.master" && AUTOFS_MASTER_D="/etc/autofs/auto.master.d"
         if [[ -f "$BUNDLE/autofs/auto.master" ]]; then
-            [[ -f /etc/auto.master ]] || sudo touch /etc/auto.master
+            [[ -f "$AUTOFS_MASTER" ]] || { sudo mkdir -p "$(dirname "$AUTOFS_MASTER")"; sudo touch "$AUTOFS_MASTER"; }
             AM_INSERTED=(); AM_SKIPPED=()
             while IFS= read -r line; do
                 [[ -z "$line" || "$line" == \#* ]] && continue
-                if grep -qF "$line" /etc/auto.master 2>/dev/null; then
+                if grep -qF "$line" "$AUTOFS_MASTER" 2>/dev/null; then
                     AM_SKIPPED+=("$line")
                 else
-                    echo "$line" | sudo tee -a /etc/auto.master > /dev/null
+                    echo "$line" | sudo tee -a "$AUTOFS_MASTER" > /dev/null
                     AM_INSERTED+=("$line")
                 fi
             done < "$BUNDLE/autofs/auto.master"
             if [[ ${#AM_INSERTED[@]} -gt 0 ]]; then
-                AUTOFS_MSG+="\nAdded to /etc/auto.master:\n"
+                AUTOFS_MSG+="\nAdded to $AUTOFS_MASTER:\n"
                 for l in "${AM_INSERTED[@]}"; do AUTOFS_MSG+="  $l\n"; done
             fi
             [[ ${#AM_SKIPPED[@]} -gt 0 ]] && { AUTOFS_MSG+="Already present (skipped):\n"; for l in "${AM_SKIPPED[@]}"; do AUTOFS_MSG+="  $l\n"; done; }
         fi
         if [[ -d "$BUNDLE/autofs/auto.master.d" ]] && [[ -n "$(ls "$BUNDLE/autofs/auto.master.d/" 2>/dev/null)" ]]; then
-            sudo mkdir -p /etc/auto.master.d
-            sudo cp -pn "$BUNDLE/autofs/auto.master.d/"* /etc/auto.master.d/ 2>/dev/null || true
-            AUTOFS_MSG+="✓ auto.master.d includes restored\n"
+            sudo mkdir -p "$AUTOFS_MASTER_D"
+            sudo cp -pn "$BUNDLE/autofs/auto.master.d/"* "$AUTOFS_MASTER_D/" 2>/dev/null || true
+            AUTOFS_MSG+="✓ auto.master.d includes restored ($AUTOFS_MASTER_D)\n"
         fi
         if [[ -s "$BUNDLE/autofs/map-file-list.txt" ]]; then
             while IFS='|' read -r orig_path safe_name; do

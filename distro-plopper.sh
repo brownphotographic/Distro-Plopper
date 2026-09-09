@@ -120,30 +120,6 @@ err()     { echo -e "${RED}[ERR]${RESET}   $*" >&2; }
 header()  { echo -e "\n${BOLD}━━━ $* ━━━${RESET}"; }
 step()    { echo -e "\n${BOLD}  ► $*${RESET}"; }
 
-# ── Desktop environment detection ────────────────────────────────────────────
-# Normalizes $XDG_CURRENT_DESKTOP (which varies a lot — Ubuntu sets
-# "ubuntu:GNOME", Plasma sets "KDE", Cinnamon sets "X-Cinnamon", etc.) into a
-# short label used to decide what desktop-specific restore steps make sense
-# and to warn when source and target desktops don't match.
-detect_de() {
-    local raw="${XDG_CURRENT_DESKTOP:-${XDG_SESSION_DESKTOP:-${DESKTOP_SESSION:-}}}"
-    case "$raw" in
-        *[Gg][Nn][Oo][Mm][Ee]*)   echo "GNOME" ;;
-        *[Kk][Dd][Ee]*|*[Pp]lasma*) echo "Plasma" ;;
-        *[Xx][Ff][Cc][Ee]*)       echo "XFCE" ;;
-        *[Cc]innamon*)            echo "Cinnamon" ;;
-        *[Cc][Oo][Ss][Mm][Ii][Cc]*) echo "COSMIC" ;;
-        *[Mm][Aa][Tt][Ee]*)       echo "MATE" ;;
-        *[Bb]udgie*)              echo "Budgie" ;;
-        *[Ll][Xx][Qq]t*|*[Ll][Xx][Dd][Ee]*) echo "LXQt" ;;
-        ""|unknown)               echo "unknown" ;;
-        *)                        echo "$raw" ;;
-    esac
-}
-# Desktops that store their settings in the dconf/GSettings database (so a
-# full `dconf dump` / `dconf load` round-trip is meaningful for them).
-de_uses_dconf() { case "$1" in GNOME|Cinnamon|Budgie) return 0 ;; *) return 1 ;; esac; }
-
 # ── Distro detection ─────────────────────────────────────────────────────────
 # Sets PKG_MANAGER, PKG_INSTALL, PKG_QUERY, PKG_QUERY_EXPLICIT, PKG_FAMILY
 # so all package operations below are distro-agnostic.
@@ -170,9 +146,9 @@ detect_distro() {
         PKG_FAMILY="fedora"
         PKG_MANAGER="dnf"
         # dnf: user-installed = reason=user, exclude groups/kernel noise
-        PKG_QUERY_EXPLICIT="dnf repoquery --userinstalled --queryformat '%{name}\n' 2>/dev/null"
+        PKG_QUERY_EXPLICIT="dnf repoquery --userinstalled --queryformat '%{name}' 2>/dev/null"
         PKG_QUERY_NATIVE="$PKG_QUERY_EXPLICIT"
-        PKG_QUERY_FOREIGN="dnf repoquery --userinstalled --queryformat '%{name}\n' --repo=* 2>/dev/null | grep -v $(dnf repolist --quiet | awk '{print $1}' | grep -v 'repo' | paste -sd'|')"
+        PKG_QUERY_FOREIGN="dnf repoquery --userinstalled --queryformat '%{name}' --repo=* 2>/dev/null | grep -v $(dnf repolist --quiet | awk '{print $1}' | grep -v 'repo' | paste -sd'|')"
         PKG_INSTALL="sudo dnf install -y"
 
     elif command -v apt &>/dev/null; then
@@ -442,9 +418,6 @@ header "PHASE 1: Scanning system..."
 SCAN_TMP=$(mktemp -d)
 trap '_pause_if_fm; rm -rf "$SCAN_TMP"' EXIT
 
-SRC_DE=$(detect_de)
-ok "Desktop environment: $SRC_DE (\$XDG_CURRENT_DESKTOP=${XDG_CURRENT_DESKTOP:-unset})"
-
 # S1. Packages
 info "Scanning packages (${PKG_MANAGER})..."
 > "$SCAN_TMP/apps.txt"
@@ -500,12 +473,10 @@ fi
 
 # S2. Flatpak
 info "Scanning Flatpak..."
-touch "$SCAN_TMP/flatpak-apps.txt" "$SCAN_TMP/flatpak-full.txt" "$SCAN_TMP/flatpak-data-dirs.txt" \
-      "$SCAN_TMP/flatpak-scope.txt" "$SCAN_TMP/flatpak-remotes.txt" "$SCAN_TMP/flatpak-local-bundles.txt"
+touch "$SCAN_TMP/flatpak-apps.txt" "$SCAN_TMP/flatpak-full.txt" "$SCAN_TMP/flatpak-data-dirs.txt"
 if command -v flatpak &>/dev/null; then
     flatpak list --app --columns=application > "$SCAN_TMP/flatpak-apps.txt"
     flatpak list --app --columns=application,name,version,origin > "$SCAN_TMP/flatpak-full.txt"
-    flatpak list --app --columns=application,installation > "$SCAN_TMP/flatpak-scope.txt"
     SCAN_RESULTS[flatpak_count]=$(wc -l < "$SCAN_TMP/flatpak-apps.txt")
     while read -r app; do
         for subdir in config data cache; do
@@ -514,31 +485,7 @@ if command -v flatpak &>/dev/null; then
         done
     done < "$SCAN_TMP/flatpak-apps.txt"
     SCAN_RESULTS[flatpak_data_size]=$(du -sh "$HOME/.var/app" 2>/dev/null | awk '{print $1}' || echo "?")
-
-    # Flatpaks installed straight from a .flatpak bundle file (not from an
-    # online repo — e.g. an app not published on Flathub) get an auto-created
-    # "origin" remote that has no URL and is hidden from `flatpak remotes`.
-    # Those can't be reinstalled with `flatpak install <remote> <app>` on
-    # another machine — there's nothing to fetch — so they're bundled up as
-    # portable .flatpak files instead (see PHASE 3 below).
-    flatpak remotes --user --show-disabled --columns=name,url 2>/dev/null > "$SCAN_TMP/flatpak-remotes.txt" || true
-    flatpak remotes --system --show-disabled --columns=name,url 2>/dev/null >> "$SCAN_TMP/flatpak-remotes.txt" || true
-    declare -A _FP_REMOTE_URL=()
-    while IFS=$'\t' read -r _rn _rurl; do
-        [[ -n "$_rn" ]] && _FP_REMOTE_URL["$_rn"]="$_rurl"
-    done < "$SCAN_TMP/flatpak-remotes.txt"
-    while IFS=$'\t' read -r _aid _origin; do
-        [[ -z "$_aid" ]] && continue
-        if [[ -z "${_FP_REMOTE_URL[$_origin]:-}" ]]; then
-            _scope=$(awk -F'\t' -v a="$_aid" '$1==a{print $2}' "$SCAN_TMP/flatpak-scope.txt")
-            echo -e "${_aid}\t${_scope:-user}" >> "$SCAN_TMP/flatpak-local-bundles.txt"
-        fi
-    done < <(awk -F'\t' '{print $1"\t"$4}' "$SCAN_TMP/flatpak-full.txt")
-    unset _FP_REMOTE_URL
-    LOCAL_FP_COUNT=$(wc -l < "$SCAN_TMP/flatpak-local-bundles.txt")
-
     ok "Flatpak: ${SCAN_RESULTS[flatpak_count]} apps, ~/.var/app: ${SCAN_RESULTS[flatpak_data_size]}"
-    [[ "$LOCAL_FP_COUNT" -gt 0 ]] && ok "  ($LOCAL_FP_COUNT sideloaded from a local bundle, not a remote — will be exported as portable .flatpak files)"
     [[ "$SKIP_FLATPAK_DATA" == true ]] && warn "Flatpak data copy SKIPPED (--skip-flatpak-data)"
 else
     SCAN_RESULTS[flatpak_count]=0; SCAN_RESULTS[flatpak_data_size]="n/a"
@@ -574,43 +521,6 @@ SCAN_RESULTS[appimage_portable]=$(wc -l < "$SCAN_TMP/appimage-portable.txt")
 [[ "${SCAN_RESULTS[appimage_portable]:-0}" -gt 0 ]] \
     && ok "AppImage portable configs: ${SCAN_RESULTS[appimage_portable]} dir(s) found" || true
 
-# S3b. Snap packages
-info "Scanning Snap packages..."
-> "$SCAN_TMP/snap-full.txt"
-if command -v snap &>/dev/null; then
-    # name<TAB>version<TAB>notes (notes carries "classic" when relevant) —
-    # skip base/runtime snaps, they aren't user-chosen apps
-    snap list 2>/dev/null | tail -n +2 | awk '{print $1"\t"$2"\t"$NF}' \
-        | grep -Ev '^(core[0-9]*|bare|snapd|gtk-common-themes|gnome-[0-9.]+-[0-9]+|kde-frameworks-[0-9.]+)\b' \
-        > "$SCAN_TMP/snap-full.txt" || true
-fi
-SCAN_RESULTS[snap_count]=$(wc -l < "$SCAN_TMP/snap-full.txt")
-[[ "${SCAN_RESULTS[snap_count]:-0}" -gt 0 ]] && ok "Snap: ${SCAN_RESULTS[snap_count]} packages" || true
-
-# S3c. Nix packages (nix-env profile — best-effort reinstall on import)
-info "Scanning Nix packages..."
-> "$SCAN_TMP/nix-packages.txt"
-if command -v nix-env &>/dev/null; then
-    nix-env -q 2>/dev/null | sort -u > "$SCAN_TMP/nix-packages.txt" || true
-fi
-SCAN_RESULTS[nix_count]=$(wc -l < "$SCAN_TMP/nix-packages.txt")
-[[ "${SCAN_RESULTS[nix_count]:-0}" -gt 0 ]] && ok "Nix: ${SCAN_RESULTS[nix_count]} packages (nix-env profile)" || true
-
-# S3d. Manually installed binaries under /opt — not owned by any package
-# manager and not already accounted for by an AppImage found above.
-# (~/.local/bin and ~/bin are handled separately below since they live in
-# $HOME and get copied wholesale rather than "manually reinstalled".)
-info "Scanning /opt for manually installed software..."
-> "$SCAN_TMP/manual-bins.txt"
-if [[ -d /opt ]]; then
-    find /opt -mindepth 1 -maxdepth 1 2>/dev/null | sort | while read -r _d; do
-        grep -qF "$_d/" "$SCAN_TMP/appimages.txt" 2>/dev/null && continue
-        echo "$_d"
-    done > "$SCAN_TMP/manual-bins.txt"
-fi
-SCAN_RESULTS[manual_bin_count]=$(wc -l < "$SCAN_TMP/manual-bins.txt")
-[[ "${SCAN_RESULTS[manual_bin_count]:-0}" -gt 0 ]] && ok "Manual /opt installs: ${SCAN_RESULTS[manual_bin_count]} found (reference only)" || true
-
 # S4. ~/.config full scan
 info "Scanning ~/.config (full)..."
 find "$HOME/.config" -mindepth 1 -maxdepth 1 -type d | sort > "$SCAN_TMP/config-dirs.txt"
@@ -635,13 +545,6 @@ SCAN_RESULTS[local_bin_count]=0
 if [[ -d "$HOME/.local/bin" ]]; then
     SCAN_RESULTS[local_bin_count]=$(find "$HOME/.local/bin" -maxdepth 1 -type f 2>/dev/null | wc -l || echo 0)
     ok "~/.local/bin: ${SCAN_RESULTS[local_bin_count]} file(s)"
-fi
-
-# S5d. ~/bin (legacy user scripts / manually compiled binaries)
-SCAN_RESULTS[home_bin_count]=0
-if [[ -d "$HOME/bin" ]]; then
-    SCAN_RESULTS[home_bin_count]=$(find "$HOME/bin" -maxdepth 1 -type f 2>/dev/null | wc -l || echo 0)
-    ok "~/bin: ${SCAN_RESULTS[home_bin_count]} file(s)"
 fi
 
 # S6. Home dotfiles
@@ -755,16 +658,12 @@ else
     SCAN_RESULTS[ssh_key_count]=0
 fi
 
-# S12. Python / npm / cargo / gem (reference only — not auto-reinstalled)
+# S12. Python / npm
 info "Scanning language packages..."
-touch "$SCAN_TMP/pip-user.txt" "$SCAN_TMP/pipx.txt" "$SCAN_TMP/npm-global.txt" "$SCAN_TMP/cargo-installed.txt" "$SCAN_TMP/gem-list.txt"
+touch "$SCAN_TMP/pip-user.txt" "$SCAN_TMP/pipx.txt" "$SCAN_TMP/npm-global.txt"
 { pip list --user --format=columns 2>/dev/null || pip3 list --user --format=columns 2>/dev/null || true; } > "$SCAN_TMP/pip-user.txt"
 { pipx list 2>/dev/null || true; } > "$SCAN_TMP/pipx.txt"
 { npm list -g --depth=0 2>/dev/null || true; } > "$SCAN_TMP/npm-global.txt"
-{ cargo install --list 2>/dev/null || true; } > "$SCAN_TMP/cargo-installed.txt"
-{ gem list --local 2>/dev/null || true; } > "$SCAN_TMP/gem-list.txt"
-SCAN_RESULTS[lang_tools_count]=$(cat "$SCAN_TMP/pip-user.txt" "$SCAN_TMP/pipx.txt" "$SCAN_TMP/npm-global.txt" "$SCAN_TMP/cargo-installed.txt" "$SCAN_TMP/gem-list.txt" 2>/dev/null | grep -c . || echo 0)
-[[ "${SCAN_RESULTS[lang_tools_count]:-0}" -gt 0 ]] && ok "Language tool packages: ${SCAN_RESULTS[lang_tools_count]} lines (pip/pipx/npm/cargo/gem, reference only)"
 
 # S13. Systemd
 info "Scanning systemd services..."
@@ -837,19 +736,9 @@ if [[ -d /etc/turboprint ]] || [[ -d /usr/share/turboprint ]]; then
     TP_PROFILES=$(ls /usr/share/turboprint/profiles/ 2>/dev/null | wc -l || echo 0)
     echo "TP_PROFILES=$TP_PROFILES" >> "$SCAN_TMP/turboprint-info.txt"
 
-    # Check for a license key. TurboPrint converts the raw .tpkey you activate
-    # with into an encrypted /etc/turboprint/turboprint.ctf and doesn't keep the
-    # original around — so it's never actually in /etc/turboprint. Look for it
-    # wherever people keep downloaded license files instead (Desktop, Downloads,
-    # Documents, home dir), since re-activating on new/reinstalled hardware
-    # needs the original .tpkey, not the derived .ctf.
-    > "$SCAN_TMP/turboprint-license-keys.txt"
-    find /etc/turboprint "$HOME" -xdev -maxdepth 6 -iname "*.tpkey" 2>/dev/null \
-        | sort -u >> "$SCAN_TMP/turboprint-license-keys.txt" || true
-    TP_KEY=$(head -1 "$SCAN_TMP/turboprint-license-keys.txt")
-    TP_KEY_COUNT=$(wc -l < "$SCAN_TMP/turboprint-license-keys.txt")
+    # Check for license key
+    TP_KEY=$(find /etc/turboprint -name "*.tpkey" 2>/dev/null | head -1 || true)
     echo "TP_KEY=$TP_KEY" >> "$SCAN_TMP/turboprint-info.txt"
-    echo "TP_KEY_COUNT=$TP_KEY_COUNT" >> "$SCAN_TMP/turboprint-info.txt"
 
     # Custom page sizes live in the PPD files — extract them
     > "$SCAN_TMP/turboprint-custom-pagesizes.txt"
@@ -860,13 +749,7 @@ if [[ -d /etc/turboprint ]] || [[ -d /usr/share/turboprint ]]; then
     done
 
     ok "TurboPrint: $TP_QUEUES printer queue(s), $TP_PROFILES profile(s)"
-    if [[ "$TP_KEY_COUNT" -gt 0 ]]; then
-        ok "TurboPrint license key found: $TP_KEY"
-        [[ "$TP_KEY_COUNT" -gt 1 ]] && ok "  ($TP_KEY_COUNT .tpkey files found total — all will be backed up)"
-    else
-        warn "TurboPrint: no .tpkey license file found anywhere under \$HOME or /etc/turboprint"
-        warn "  The active license is baked into /etc/turboprint/turboprint.ctf (still backed up), but re-activating on new/reinstalled hardware needs the original .tpkey"
-    fi
+    [[ -n "$TP_KEY" ]] && ok "TurboPrint license key found: $TP_KEY"         || warn "TurboPrint: no .tpkey license file found in /etc/turboprint"
 else
     ok "TurboPrint: not installed (skipping)"
 fi
@@ -985,10 +868,7 @@ cat > "$SM" << SMEOF
 | ${PKG_MANAGER} apps | ${SCAN_RESULTS[pacman_apps]:-0} |
 | ${PKG_MANAGER} CLI tools | ${SCAN_RESULTS[pacman_cli]:-0} |
 | Flatpak apps | ${SCAN_RESULTS[flatpak_count]:-0} |
-| Snap packages | ${SCAN_RESULTS[snap_count]:-0} |
-| Nix packages | ${SCAN_RESULTS[nix_count]:-0} |
 | AppImages | ${SCAN_RESULTS[appimage_count]:-0} |
-| Manual /opt installs | ${SCAN_RESULTS[manual_bin_count]:-0} |
 
 ### Foreign / 3rd-party Packages
 \`\`\`
@@ -1010,21 +890,6 @@ $(cat "$SCAN_TMP/ppa-list.txt" 2>/dev/null || echo "(none or not Ubuntu/Debian)"
 $(cat "$SCAN_TMP/appimages.txt" 2>/dev/null || echo "(none)")
 \`\`\`
 
-### Snap Packages
-\`\`\`
-$(cat "$SCAN_TMP/snap-full.txt" 2>/dev/null || echo "(none)")
-\`\`\`
-
-### Nix Packages (nix-env profile)
-\`\`\`
-$(cat "$SCAN_TMP/nix-packages.txt" 2>/dev/null || echo "(none)")
-\`\`\`
-
-### Manual /opt Installs (reference only — not owned by a package manager)
-\`\`\`
-$(cat "$SCAN_TMP/manual-bins.txt" 2>/dev/null || echo "(none)")
-\`\`\`
-
 ### pip (user)
 \`\`\`
 $(cat "$SCAN_TMP/pip-user.txt" 2>/dev/null || echo "(none)")
@@ -1038,16 +903,6 @@ $(cat "$SCAN_TMP/pipx.txt" 2>/dev/null || echo "(none)")
 ### npm global
 \`\`\`
 $(cat "$SCAN_TMP/npm-global.txt" 2>/dev/null || echo "(none)")
-\`\`\`
-
-### cargo installed
-\`\`\`
-$(cat "$SCAN_TMP/cargo-installed.txt" 2>/dev/null || echo "(none)")
-\`\`\`
-
-### gem (local)
-\`\`\`
-$(cat "$SCAN_TMP/gem-list.txt" 2>/dev/null || echo "(none)")
 \`\`\`
 
 ---
@@ -1275,7 +1130,7 @@ $(if [[ -f "$SCAN_TMP/turboprint-info.txt" ]] && grep -q "TP_FOUND=true" "$SCAN_
     echo "|------|--------|"
     echo "| Printer queues | $TP_QUEUES |"
     echo "| ICC profiles | $TP_PROFILES |"
-    echo "| License key(s) | ${TP_KEY_COUNT:-0} found${TP_KEY:+ (e.g. \`$TP_KEY\`)} |"
+    echo "| License key | ${TP_KEY:-not found} |"
     echo ""
     echo "### Custom Page Sizes"
     echo '\`\`\`'
@@ -1339,13 +1194,9 @@ echo ""
 printf "  ${CYAN}%-30s${RESET}\n" "PACKAGES"
 printf "  %-30s %s\n" "${PKG_MANAGER^} packages:" "${SCAN_RESULTS[pacman_apps]:-0} apps, ${SCAN_RESULTS[pacman_cli]:-0} CLI tools"
 printf "  %-30s %s\n" "Flatpak apps:"     "${SCAN_RESULTS[flatpak_count]:-0}  (data: ${SCAN_RESULTS[flatpak_data_size]:-?})"
-printf "  %-30s %s\n" "Snap packages:"    "${SCAN_RESULTS[snap_count]:-0}"
-printf "  %-30s %s\n" "Nix packages:"     "${SCAN_RESULTS[nix_count]:-0}"
 printf "  %-30s %s\n" "AppImages:"        "${SCAN_RESULTS[appimage_count]:-0}"
-printf "  %-30s %s\n" "Manual /opt installs:" "${SCAN_RESULTS[manual_bin_count]:-0}"
 echo ""
 printf "  ${CYAN}%-30s${RESET}\n" "CONFIGURATION"
-printf "  %-30s %s\n" "Desktop environment:" "$SRC_DE"
 printf "  %-30s %s\n" "~/.config dirs:"   "${SCAN_RESULTS[config_dir_count]:-0}  (${SCAN_RESULTS[config_size]:-?})"
 printf "  %-30s %s\n" "Home dotfiles:"    "${SCAN_RESULTS[dotfile_count]:-0}"
 printf "  %-30s %s\n" "~/.local/share:"   "${SCAN_RESULTS[local_share_size]:-?}"
@@ -1405,13 +1256,9 @@ System scan complete. Here's what was found:
   Packages
     ${PKG_MANAGER^}: ${SCAN_RESULTS[pacman_apps]:-0} apps, ${SCAN_RESULTS[pacman_cli]:-0} CLI tools
     Flatpak:  ${SCAN_RESULTS[flatpak_count]:-0} apps  (data: ${SCAN_RESULTS[flatpak_data_size]:-?})
-    Snap:     ${SCAN_RESULTS[snap_count]:-0} packages
-    Nix:      ${SCAN_RESULTS[nix_count]:-0} packages
     AppImages:${SCAN_RESULTS[appimage_count]:-0} found
-    Manual /opt installs: ${SCAN_RESULTS[manual_bin_count]:-0} found
 
   Configuration
-    Desktop:   $SRC_DE
     ~/.config: ${SCAN_RESULTS[config_dir_count]:-0} app dirs  (${SCAN_RESULTS[config_size]:-?})
     Dotfiles:  ${SCAN_RESULTS[dotfile_count]:-0} files
     ~/.local/share: ${SCAN_RESULTS[local_share_size]:-?}
@@ -1472,15 +1319,11 @@ ARCHIVE="$(dirname "$OUTPUT_DIR")/distro-plopper-$TIMESTAMP.tar.gz"
 # Build checklist with sizes from scan
 
 EXP_OPTS=()
-EXP_OPTS+=("packages"    "Package lists — ${PKG_MANAGER} (${SCAN_RESULTS[pacman_total]:-0}), Flatpak (${SCAN_RESULTS[flatpak_count]:-0}), Snap (${SCAN_RESULTS[snap_count]:-0}), Nix (${SCAN_RESULTS[nix_count]:-0}), AppImages (${SCAN_RESULTS[appimage_count]:-0})" "ON")
+EXP_OPTS+=("packages"    "Package lists — ${PKG_MANAGER} (${SCAN_RESULTS[pacman_total]:-0}), Flatpak (${SCAN_RESULTS[flatpak_count]:-0}), AppImages (${SCAN_RESULTS[appimage_count]:-0})" "ON")
 EXP_OPTS+=("configs"     "App configs — ~/.config (${SCAN_RESULTS[config_dir_count]:-0} dirs, ${SCAN_RESULTS[config_size]:-?})" "ON")
 EXP_OPTS+=("dotfiles"    "Home dotfiles — .bashrc, .zshrc, .gitconfig etc. (${SCAN_RESULTS[dotfile_count]:-0} files)" "ON")
 EXP_OPTS+=("localshare"  "~/.local/share app data (${SCAN_RESULTS[local_share_size]:-?} total, Steam excluded)" "ON")
-if [[ "$SRC_DE" == "GNOME" ]]; then
-    EXP_OPTS+=("gnome"   "GNOME — dconf settings + ${SCAN_RESULTS[gnome_ext_count]:-0} extensions + themes" "ON")
-else
-    EXP_OPTS+=("gnome"   "$SRC_DE desktop — themes/icons + any dconf/GSettings data found" "ON")
-fi
+EXP_OPTS+=("gnome"       "GNOME — dconf settings + ${SCAN_RESULTS[gnome_ext_count]:-0} extensions + themes" "ON")
 EXP_OPTS+=("ssh"         "SSH config & known_hosts (private keys NOT copied)" "ON")
 EXP_OPTS+=("fonts"       "User fonts — ${SCAN_RESULTS[font_count]:-0} files" "ON")
 EXP_OPTS+=("nfs"         "NFS — exports=${SCAN_RESULTS[nfs_exports]:-false}, fstab mounts=${SCAN_RESULTS[nfs_mounts]:-false}" "ON")
@@ -1647,7 +1490,7 @@ Archive will be saved to:
 
 # ── Confirm ───────────────────────────────────────────────────────────────────
 SELECTED_LIST=""
-[[ "$EXP_PACKAGES"   == true ]] && SELECTED_LIST+="  ✓ Packages (${PKG_MANAGER}, Flatpak, Snap, Nix, AppImages)\n"
+[[ "$EXP_PACKAGES"   == true ]] && SELECTED_LIST+="  ✓ Packages (pacman, Flatpak, AppImages)\n"
 [[ "$EXP_CONFIGS"    == true ]] && SELECTED_LIST+="  ✓ App configs (~/.config)\n"
 [[ "$EXP_DOTFILES"   == true ]] && SELECTED_LIST+="  ✓ Home dotfiles\n"
 [[ "$EXP_LOCALSHARE" == true ]] && SELECTED_LIST+="  ✓ ~/.local/share data\n"
@@ -1765,7 +1608,7 @@ copy_with_spinner() {
 # PHASE 2: CREATE OUTPUT STRUCTURE
 # =============================================================================
 header "PHASE 2: Creating output structure..."
-mkdir -p "$OUTPUT_DIR"/{packages,configs/{dotfiles,config-dirs,local-share,local-state,local-bin,home-bin},flatpak,browsers,gnome/extensions-backup,nfs,autofs,ssh,fonts,systemd,docker,hardware,steam,homedirs,user-homes,scripts}
+mkdir -p "$OUTPUT_DIR"/{packages,configs/{dotfiles,config-dirs,local-share,local-state,local-bin},flatpak,browsers,gnome/extensions-backup,nfs,autofs,ssh,fonts,systemd,docker,hardware,steam,homedirs,user-homes,scripts}
 
 MD="$OUTPUT_DIR/MIGRATION_REPORT.md"
 
@@ -1800,7 +1643,6 @@ MDEOF
 # PHASE 3: COPY
 # =============================================================================
 header "PHASE 3: Copying files..."
-echo "source_de=$SRC_DE" >> "$MANIFEST"
 
 # ── Packages ──────────────────────────────────────────────────────────────────
 if [[ "$EXP_PACKAGES" == true ]]; then
@@ -1808,19 +1650,6 @@ section_md "1. Packages"
 cp "$SCAN_TMP/apps.txt"      "$OUTPUT_DIR/packages/" 2>/dev/null || true
 cp "$SCAN_TMP/cli-tools.txt" "$OUTPUT_DIR/packages/" 2>/dev/null || true
 cp "$SCAN_TMP"/flatpak-*.txt "$OUTPUT_DIR/packages/" 2>/dev/null || true
-if [[ -s "$SCAN_TMP/flatpak-local-bundles.txt" ]]; then
-    mkdir -p "$OUTPUT_DIR/flatpak/bundles"
-    while IFS=$'\t' read -r _laid _lscope; do
-        [[ -z "$_laid" ]] && continue
-        _lrepo="$HOME/.local/share/flatpak/repo"
-        [[ "$_lscope" == "system" ]] && _lrepo="/var/lib/flatpak/repo"
-        if flatpak build-bundle "$_lrepo" "$OUTPUT_DIR/flatpak/bundles/${_laid}.flatpak" "$_laid" &>>"$OUTPUT_DIR/flatpak-bundle-build.log"; then
-            ok "Bundled sideloaded Flatpak: $_laid"
-        else
-            warn "Could not create a portable bundle for sideloaded Flatpak $_laid — it won't be reinstallable on import (see flatpak-bundle-build.log)"
-        fi
-    done < "$SCAN_TMP/flatpak-local-bundles.txt"
-fi
 cp "$SCAN_TMP/appimages.txt"  "$OUTPUT_DIR/packages/" 2>/dev/null || true
 if [[ -s "$SCAN_TMP/appimage-portable.txt" ]]; then
     mkdir -p "$OUTPUT_DIR/packages/appimage-portable"
@@ -1833,8 +1662,7 @@ if [[ -s "$SCAN_TMP/appimage-portable.txt" ]]; then
     done < "$SCAN_TMP/appimage-portable.txt"
     ok "AppImage portable configs copied (${SCAN_RESULTS[appimage_portable]} dir(s))"
 fi
-cp "$SCAN_TMP/snap-full.txt" "$SCAN_TMP/nix-packages.txt" "$SCAN_TMP/manual-bins.txt" "$OUTPUT_DIR/packages/" 2>/dev/null || true
-cp "$SCAN_TMP/pip-user.txt" "$SCAN_TMP/pipx.txt" "$SCAN_TMP/npm-global.txt" "$SCAN_TMP/cargo-installed.txt" "$SCAN_TMP/gem-list.txt" "$OUTPUT_DIR/packages/" 2>/dev/null || true
+cp "$SCAN_TMP/pip-user.txt" "$SCAN_TMP/pipx.txt" "$SCAN_TMP/npm-global.txt" "$OUTPUT_DIR/packages/" 2>/dev/null || true
 echo "packages_present=true"                        >> "$MANIFEST"
 echo "pkg_manager=$PKG_MANAGER"                     >> "$MANIFEST"
 echo "pkg_family=$PKG_FAMILY"                       >> "$MANIFEST"
@@ -1842,28 +1670,15 @@ echo "pkg_apps_file=apps.txt"                       >> "$MANIFEST"
 echo "desktop_app_count=${SCAN_RESULTS[desktop_app_count]:-0}" >> "$MANIFEST"
 echo "cli_count=${SCAN_RESULTS[pacman_cli]:-0}"     >> "$MANIFEST"
 echo "flatpak_count=${SCAN_RESULTS[flatpak_count]:-0}" >> "$MANIFEST"
-echo "snap_count=${SCAN_RESULTS[snap_count]:-0}"    >> "$MANIFEST"
-echo "nix_count=${SCAN_RESULTS[nix_count]:-0}"      >> "$MANIFEST"
-echo "manual_bin_count=${SCAN_RESULTS[manual_bin_count]:-0}" >> "$MANIFEST"
 note_md "Restore apps: \`$PKG_INSTALL < packages/apps.txt\`"
 note_md "Restore Flatpak: \`flatpak install \$(cat packages/flatpak-apps.txt)\`"
-note_md "Restore Snap: \`sudo snap install \$(cut -f1 packages/snap-full.txt)\`  (add --classic per-package as needed, see column 3)"
-note_md "Restore Nix (best effort): \`while read -r p _; do nix-env -iA nixpkgs.\$p; done < packages/nix-packages.txt\`"
 log_md "### ${PKG_MANAGER^}: ${SCAN_RESULTS[pacman_apps]:-0} apps, ${SCAN_RESULTS[pacman_cli]:-0} CLI tools"
 log_md "#### Apps"; log_md '```'; cat "$SCAN_TMP/apps.txt" >> "$MD"; log_md '```'
 log_md "#### CLI tools (reference only)"; log_md '```'; cat "$SCAN_TMP/cli-tools.txt" >> "$MD"; log_md '```'
 log_md "### Flatpak: ${SCAN_RESULTS[flatpak_count]:-0} apps"
 log_md '```'; cat "$SCAN_TMP/flatpak-full.txt" >> "$MD"; log_md '```'
-log_md "### Snap: ${SCAN_RESULTS[snap_count]:-0} packages"
-log_md '```'; cat "$SCAN_TMP/snap-full.txt" >> "$MD"; log_md '```'
-log_md "### Nix: ${SCAN_RESULTS[nix_count]:-0} packages (nix-env profile)"
-log_md '```'; cat "$SCAN_TMP/nix-packages.txt" >> "$MD"; log_md '```'
 log_md "### AppImages"
 log_md '```'; cat "$SCAN_TMP/appimages.txt" >> "$MD"; log_md '```'
-log_md "### Manual /opt Installs (reference only)"
-log_md '```'; cat "$SCAN_TMP/manual-bins.txt" >> "$MD"; log_md '```'
-log_md "### Language tool packages (pip/pipx/npm/cargo/gem — reference only)"
-log_md '```'; cat "$SCAN_TMP/pip-user.txt" "$SCAN_TMP/pipx.txt" "$SCAN_TMP/npm-global.txt" "$SCAN_TMP/cargo-installed.txt" "$SCAN_TMP/gem-list.txt" >> "$MD" 2>/dev/null; log_md '```'
 ok "Package lists saved (${PKG_MANAGER})"
 fi # EXP_PACKAGES
 
@@ -1950,15 +1765,6 @@ if [[ -d "$HOME/.local/bin" ]] && [[ "${SCAN_RESULTS[local_bin_count]:-0}" -gt 0
     echo "local_bin_present=true" >> "$MANIFEST"
     ok "~/.local/bin copied (${SCAN_RESULTS[local_bin_count]:-0} file(s))"
 fi
-
-# ── ~/bin ─────────────────────────────────────────────────────────────────────
-if [[ -d "$HOME/bin" ]] && [[ "${SCAN_RESULTS[home_bin_count]:-0}" -gt 0 ]]; then
-    section_md "4d. ~/bin"
-    note_md "Legacy user scripts / manually compiled binaries."
-    cp -r "$HOME/bin/." "$OUTPUT_DIR/configs/home-bin/" 2>/dev/null || true
-    echo "home_bin_present=true" >> "$MANIFEST"
-    ok "~/bin copied (${SCAN_RESULTS[home_bin_count]:-0} file(s))"
-fi
 fi # EXP_LOCALSHARE
 
 # ── Steam config ──────────────────────────────────────────────────────────────
@@ -2035,9 +1841,9 @@ else
 fi
 fi # EXP_BROWSERS
 
-# ── GNOME / Desktop Environment ────────────────────────────────────────────────
+# ── GNOME ─────────────────────────────────────────────────────────────────────
 if [[ "$EXP_GNOME" == true ]]; then
-section_md "7. Desktop Environment ($SRC_DE)"
+section_md "7. GNOME Configuration"
 cp "$SCAN_TMP/gnome-extensions-all.txt" "$SCAN_TMP/gnome-extensions-enabled.txt" "$SCAN_TMP/dconf-full.ini" "$OUTPUT_DIR/gnome/" 2>/dev/null || true
 if command -v dconf &>/dev/null; then
     for ns in /org/gnome/shell /org/gnome/desktop /org/gnome/settings-daemon /org/gnome/mutter /org/gnome/terminal /org/gtk; do
@@ -2048,14 +1854,10 @@ fi
 USER_EXT="$HOME/.local/share/gnome-shell/extensions"
 [[ -d "$USER_EXT" ]] && cp -r "$USER_EXT"/. "$OUTPUT_DIR/gnome/extensions-backup/" 2>/dev/null || true
 echo "gnome_present=true" >> "$MANIFEST"
-if de_uses_dconf "$SRC_DE"; then
-    note_md "Restore: \`dconf load / < gnome/dconf-full.ini\`"
-else
-    note_md "$SRC_DE does not store its own settings in dconf, so \`gnome/dconf-full.ini\` mostly won't apply here. $SRC_DE's panel layout, keyboard shortcuts and theme live under ~/.config/* instead and are captured by the App Configs backup (section 2) — no separate restore step needed on a $SRC_DE target."
-fi
+note_md "Restore: \`dconf load / < gnome/dconf-full.ini\`"
 log_md "### Extensions"; log_md '```'; cat "$SCAN_TMP/gnome-extensions-all.txt" >> "$MD"; log_md '```'
 log_md "### Themes & Icons"; log_md '```'; cat "$SCAN_TMP/themes.txt" >> "$MD"; log_md '```'
-[[ "$SRC_DE" != "GNOME" ]] && ok "$SRC_DE config copied (via ~/.config; GNOME-specific dconf/extensions data will be empty)" || ok "GNOME config copied"
+ok "GNOME config copied"
 fi # EXP_GNOME
 
 # ── NFS ───────────────────────────────────────────────────────────────────────
@@ -2221,21 +2023,6 @@ grep -v "^#\|^$" /etc/default/grub 2>/dev/null >> "$MD" || true; log_md '```'
 log_md "### Locale & Timezone"; log_md '```'
 localectl status 2>/dev/null >> "$MD" || true; log_md '```'
 
-# Keyboard layout (console + X11) — system-wide, distinct from GNOME's
-# per-user dconf keyboard settings (shortcuts, input-sources) which are
-# already captured/restored wholesale via dconf dump/load below.
-if command -v localectl &>/dev/null; then
-    _LCTL=$(localectl status 2>/dev/null)
-    {
-        echo "vc_keymap=$(echo "$_LCTL" | sed -n 's/^ *VC Keymap: *//p')"
-        echo "x11_layout=$(echo "$_LCTL" | sed -n 's/^ *X11 Layout: *//p')"
-        echo "x11_model=$(echo "$_LCTL" | sed -n 's/^ *X11 Model: *//p')"
-        echo "x11_variant=$(echo "$_LCTL" | sed -n 's/^ *X11 Variant: *//p')"
-        echo "x11_options=$(echo "$_LCTL" | sed -n 's/^ *X11 Options: *//p')"
-    } > "$OUTPUT_DIR/configs/keyboard-layout.conf"
-    note_md "Restore keyboard layout: run \`bash distro-plopper.sh --import\` or manually via \`localectl set-keymap\` / \`set-x11-keymap\` using configs/keyboard-layout.conf"
-fi
-
 # ── Systemd ───────────────────────────────────────────────────────────────────
 if [[ "$EXP_SYSTEMD" == true ]]; then
 section_md "12. Systemd"
@@ -2338,24 +2125,7 @@ if [[ "$EXP_TURBOPRINT" == true ]] && [[ "${SCAN_RESULTS[tp_found]:-false}" == "
     section_md "15. TurboPrint"
     note_md "⚠️  Install TurboPrint on the new system FIRST, then restore these files."
     note_md "License key: re-run \`sudo tpsetup --install <keyfile>\` after copying."
-    mkdir -p "$OUTPUT_DIR/turboprint/"{config,profiles,ppd,user,license}
-
-    # Original .tpkey license file(s) — not present in /etc/turboprint (TurboPrint
-    # consumes them into turboprint.ctf on activation), found instead wherever the
-    # user kept the downloaded key. Needed to re-activate on new/reinstalled hardware.
-    if [[ -s "$SCAN_TMP/turboprint-license-keys.txt" ]]; then
-        while IFS= read -r _tpkey; do
-            [[ -f "$_tpkey" ]] && cp -n "$_tpkey" "$OUTPUT_DIR/turboprint/license/" 2>/dev/null || true
-        done < "$SCAN_TMP/turboprint-license-keys.txt"
-        TPKEY_BACKED_UP=$(ls "$OUTPUT_DIR/turboprint/license/" 2>/dev/null | wc -l)
-        ok "TurboPrint: $TPKEY_BACKED_UP license key file(s) backed up"
-        log_md "### License Key Files"
-        log_md '```'
-        cat "$SCAN_TMP/turboprint-license-keys.txt" >> "$MD"
-        log_md '```'
-    else
-        warn "TurboPrint: no .tpkey found anywhere to back up — the active license is still in config/turboprint.ctf, but you'll need the original key to re-activate on different hardware"
-    fi
+    mkdir -p "$OUTPUT_DIR/turboprint/"{config,profiles,ppd,user}
 
     # /etc/turboprint — main config + license key
     if [[ -d /etc/turboprint ]]; then
@@ -2408,7 +2178,7 @@ if [[ "$EXP_TURBOPRINT" == true ]] && [[ "${SCAN_RESULTS[tp_found]:-false}" == "
     log_md "4. \`sudo cp -r turboprint/profiles/. /usr/share/turboprint/profiles/\`"
     log_md "5. \`cp turboprint/user/dot-turboprint ~/.turboprint\`"
     log_md "6. \`sudo systemctl restart cups\`"
-    log_md "7. If the license doesn't carry over (e.g. new/reinstalled hardware), re-activate with \`sudo tpsetup --install turboprint/license/<keyfile>.tpkey\`"
+    log_md "7. Re-run \`sudo tpsetup --install <keyfile>\` if needed"
 fi
 
 # ── Cron ──────────────────────────────────────────────────────────────────────
@@ -2431,11 +2201,7 @@ cat >> "$MD" << 'CHECKLIST'
 - [ ] Debian/Ubuntu: `xargs sudo apt install -y < packages/apt-native.txt`
 - [ ] Ubuntu PPAs: re-add from `packages/ppa-sources.txt` via `add-apt-repository`
 - [ ] `flatpak install $(cat packages/flatpak-apps.txt)`
-- [ ] Snap: `sudo snap install $(cut -f1 packages/snap-full.txt)` (add `--classic` per-package as needed — see column 3 of the file)
-- [ ] Nix (best effort): `while read -r p _; do nix-env -iA nixpkgs.$p; done < packages/nix-packages.txt`
 - [ ] Reinstall AppImages from `packages/appimages.txt`
-- [ ] Review `packages/manual-bins.txt` — software manually installed under `/opt`, needs manual reinstall
-- [ ] Review `packages/pip-user.txt`, `pipx.txt`, `npm-global.txt`, `cargo-installed.txt`, `gem-list.txt` — reference only, reinstall with each tool's own installer
 
 ### Configs
 - [ ] Run `bash distro-plopper.sh --import --bundle <this_dir>`
@@ -2445,11 +2211,8 @@ cat >> "$MD" << 'CHECKLIST'
 - [ ] `cp -rn flatpak/var-app/. ~/.var/app/`
 
 ### GNOME
-- [ ] `dconf load / < gnome/dconf-full.ini` (includes keyboard shortcuts, input sources, custom keybindings)
+- [ ] `dconf load / < gnome/dconf-full.ini`
 - [ ] Enable extensions via Extensions app
-
-### Keyboard Layout (console + X11 — not part of GNOME dconf)
-- [ ] `sudo localectl set-keymap <vc_keymap>` and `sudo localectl set-x11-keymap <x11_layout> <x11_model> <x11_variant> <x11_options>` — values in `configs/keyboard-layout.conf`
 
 ### SSH
 - [ ] Copy `~/.ssh/id_*` manually
@@ -2480,7 +2243,7 @@ cat >> "$MD" << 'CHECKLIST'
 - [ ] `sudo cp -r turboprint/profiles/. /usr/share/turboprint/profiles/`
 - [ ] `cp turboprint/user/dot-turboprint ~/.turboprint`
 - [ ] `sudo systemctl restart cups`
-- [ ] If the license doesn't carry over: `sudo tpsetup --install turboprint/license/<keyfile>.tpkey`
+- [ ] Verify license: `sudo tpsetup --install /etc/turboprint/<keyfile>.tpkey`
 
 ### Final
 - [ ] Reboot
@@ -2731,120 +2494,11 @@ do_large_copy() {
     fi
 }
 
-# Installs the given Flatpak app IDs from $BUNDLE. Handles three cases:
-#  - normal apps from a real remote (flathub, fedora, or a custom repo with
-#    a URL) — the remote is added if the target doesn't have it yet
-#  - apps sideloaded from a local .flatpak bundle file with no reachable
-#    remote (e.g. an app not published anywhere) — reinstalled from the
-#    portable .flatpak file exported into $BUNDLE/flatpak/bundles/
-# Takes the array of app IDs to install by name (nameref).
-install_flatpak_apps() {
-    local -n _fp_apps="$1"
-    [[ "${#_fp_apps[@]}" -eq 0 ]] && return 0
-
-    local _aid _n _v _ori _sc _rn _rurl _rem _app _fp_known
-    local -A _fp_rmap=() _fp_scope=() _fp_local=()
-    [[ -f "$BUNDLE/packages/flatpak-full.txt" ]] && while IFS=$'\t' read -r _aid _n _v _ori; do
-        _fp_rmap["$_aid"]="${_ori:-flathub}"
-    done < "$BUNDLE/packages/flatpak-full.txt"
-    [[ -f "$BUNDLE/packages/flatpak-scope.txt" ]] && while IFS=$'\t' read -r _aid _sc; do
-        _fp_scope["$_aid"]="$_sc"
-    done < "$BUNDLE/packages/flatpak-scope.txt"
-    [[ -f "$BUNDLE/packages/flatpak-local-bundles.txt" ]] && while IFS=$'\t' read -r _aid _sc; do
-        _fp_local["$_aid"]=1
-    done < "$BUNDLE/packages/flatpak-local-bundles.txt"
-
-    # Re-add any missing custom remotes that have a real, fetchable URL.
-    if [[ -f "$BUNDLE/packages/flatpak-remotes.txt" ]]; then
-        _fp_known=$(flatpak remotes --columns=name 2>/dev/null || true)
-        while IFS=$'\t' read -r _rn _rurl; do
-            [[ -z "$_rn" || -z "$_rurl" ]] && continue
-            grep -qx "$_rn" <<< "$_fp_known" && continue
-            flatpak remote-add --if-not-exists "$_rn" "$_rurl" 2>&1 | tee -a "$IMPORT_LOG" || true
-        done < "$BUNDLE/packages/flatpak-remotes.txt"
-    fi
-
-    local _fp_ok=true
-    local -A _fp_byremote=()
-    for _app in "${_fp_apps[@]}"; do
-        if [[ -n "${_fp_local[$_app]:-}" ]]; then
-            local _fp_bundlefile="$BUNDLE/flatpak/bundles/${_app}.flatpak"
-            local _fp_scflag="--user"; [[ "${_fp_scope[$_app]:-}" == "system" ]] && _fp_scflag="--system"
-            if [[ -f "$_fp_bundlefile" ]]; then
-                if flatpak info $_fp_scflag "$_app" &>/dev/null; then
-                    info "  $_app already installed — skipping (re-run \`flatpak update $_fp_scflag $_app\` manually to update from the bundle)"
-                else
-                    flatpak install --noninteractive $_fp_scflag "$_fp_bundlefile" 2>&1 | tee -a "$IMPORT_LOG" \
-                        || { warn "Failed to install sideloaded app $_app"; _fp_ok=false; }
-                fi
-            else
-                warn "No portable bundle found for sideloaded app $_app (was it exported before this feature existed?) — skipping"
-                _fp_ok=false
-            fi
-        else
-            _rem="${_fp_rmap[$_app]:-flathub}"
-            _fp_byremote["$_rem"]+=" $_app"
-        fi
-    done
-    for _rem in "${!_fp_byremote[@]}"; do
-        read -ra _grp <<< "${_fp_byremote[$_rem]}"
-        flatpak install --noninteractive --or-update "$_rem" "${_grp[@]}" 2>&1 | tee -a "$IMPORT_LOG" \
-            || { warn "Some Flatpak apps from $_rem failed"; _fp_ok=false; }
-    done
-    [[ "$_fp_ok" == true ]] && ok "Flatpak apps done" || warn "Some Flatpak apps may not have installed — check log above"
-}
-
-# System-wide keyboard layout (console + X11/Wayland) — distinct from GNOME's
-# per-user dconf keyboard settings, which are restored separately via dconf load.
-restore_keyboard_layout() {
-    local conf="$BUNDLE/configs/keyboard-layout.conf"
-    [[ -f "$conf" ]] || return 0
-    command -v localectl &>/dev/null || { warn "localectl not found — restore keyboard layout manually from $conf"; add_manual "Restore keyboard layout manually — see $conf"; return 0; }
-    local vc_keymap x11_layout x11_model x11_variant x11_options
-    vc_keymap=$(grep '^vc_keymap='   "$conf" | cut -d= -f2-)
-    x11_layout=$(grep '^x11_layout=' "$conf" | cut -d= -f2-)
-    x11_model=$(grep '^x11_model='   "$conf" | cut -d= -f2-)
-    x11_variant=$(grep '^x11_variant=' "$conf" | cut -d= -f2-)
-    x11_options=$(grep '^x11_options=' "$conf" | cut -d= -f2-)
-    if [[ "$DRY_RUN" == true ]]; then
-        info "[DRY RUN] would set keyboard layout: vc=$vc_keymap x11=$x11_layout/$x11_variant"
-        return 0
-    fi
-    [[ -n "$vc_keymap" ]] && { sudo localectl set-keymap "$vc_keymap" 2>/dev/null || warn "Failed to set console keymap: $vc_keymap"; }
-    if [[ -n "$x11_layout" ]]; then
-        local -a x11_args=("$x11_layout")
-        if [[ -n "$x11_model" ]]; then
-            x11_args+=("$x11_model")
-            if [[ -n "$x11_variant" ]]; then
-                x11_args+=("$x11_variant")
-                [[ -n "$x11_options" ]] && x11_args+=("$x11_options")
-            fi
-        fi
-        sudo localectl set-x11-keymap "${x11_args[@]}" 2>/dev/null || warn "Failed to set X11 keymap: $x11_layout"
-    fi
-    ok "Keyboard layout restored (vc=${vc_keymap:-?}, x11=${x11_layout:-?}${x11_variant:+/$x11_variant})"
-    log_import "RESTORED: keyboard layout ($vc_keymap / $x11_layout $x11_variant)"
-}
-
 # ── Read bundle contents for display ─────────────────────────────────────────
 # Read package manager info from manifest
 SRC_PKG_MANAGER=$(get_manifest "pkg_manager" "pacman")
 SRC_PKG_FAMILY=$(get_manifest "pkg_family" "arch")
 SRC_PKG_SUBFAMILY=$(get_manifest "pkg_subfamily" "")
-# Desktop environment: source (from bundle) vs target (this system, if a
-# desktop session is already running — often unknown on a fresh TTY-only import)
-SRC_DE=$(get_manifest "source_de" "unknown")
-TARGET_DE=$(detect_de)
-SAME_DE=false
-[[ "$SRC_DE" == "$TARGET_DE" ]] && SAME_DE=true
-DE_MISMATCH_NOTE=""
-if [[ "$TARGET_DE" != "unknown" ]] && [[ "$SAME_DE" == false ]]; then
-    DE_MISMATCH_NOTE="
-NOTE: Source desktop was $SRC_DE, this session is $TARGET_DE.
-Panel layout, keyboard shortcuts, and theme are stored differently
-per desktop and will NOT carry over. Your individual apps' own
-settings (browser, editor, etc.) restore normally regardless."
-fi
 # Determine install commands for the CURRENT (target) system
 detect_distro  # re-run to get current system pkg manager
 case "$PKG_FAMILY" in
@@ -2885,20 +2539,12 @@ SRC_PKG_FOREIGN_FILE=$(get_manifest "pkg_foreign_file" "${SRC_PKG_MANAGER}-forei
 [[ -f "$BUNDLE/packages/$SRC_PKG_FOREIGN_FILE" ]] && AUR_COUNT=$(wc -l < "$BUNDLE/packages/$SRC_PKG_FOREIGN_FILE")
 FLATPAK_COUNT=0; [[ -f "$BUNDLE/packages/flatpak-apps.txt"  ]] && FLATPAK_COUNT=$(wc -l < "$BUNDLE/packages/flatpak-apps.txt")
 APPIMAGE_COUNT=0;[[ -f "$BUNDLE/packages/appimages.txt"     ]] && APPIMAGE_COUNT=$(wc -l < "$BUNDLE/packages/appimages.txt")
-SNAP_COUNT=0;    [[ -f "$BUNDLE/packages/snap-full.txt"     ]] && SNAP_COUNT=$(wc -l < "$BUNDLE/packages/snap-full.txt")
-NIX_COUNT=0;     [[ -f "$BUNDLE/packages/nix-packages.txt"  ]] && NIX_COUNT=$(wc -l < "$BUNDLE/packages/nix-packages.txt")
-MANUAL_BIN_COUNT=0; [[ -f "$BUNDLE/packages/manual-bins.txt" ]] && MANUAL_BIN_COUNT=$(wc -l < "$BUNDLE/packages/manual-bins.txt")
-LANG_TOOLS_COUNT=0
-for _lf in pip-user.txt pipx.txt npm-global.txt cargo-installed.txt gem-list.txt; do
-    [[ -f "$BUNDLE/packages/$_lf" ]] && LANG_TOOLS_COUNT=$(( LANG_TOOLS_COUNT + $(grep -c . "$BUNDLE/packages/$_lf" 2>/dev/null || echo 0) ))
-done
 
 HAS_CONFIGS=$( [[ -d "$BUNDLE/configs/config-dirs" ]] && echo true || echo false)
 HAS_DOTFILES=$([[ -d "$BUNDLE/configs/dotfiles"    ]] && echo true || echo false)
 HAS_LOCAL=$(   [[ -d "$BUNDLE/configs/local-share" ]] && echo true || echo false)
 HAS_STATE=$(   [[ -d "$BUNDLE/configs/local-state" ]] && [[ -n "$(ls "$BUNDLE/configs/local-state/" 2>/dev/null)" ]] && echo true || echo false)
 HAS_BIN=$(     [[ -d "$BUNDLE/configs/local-bin"   ]] && [[ -n "$(ls "$BUNDLE/configs/local-bin/"   2>/dev/null)" ]] && echo true || echo false)
-HAS_HOME_BIN=$([[ -d "$BUNDLE/configs/home-bin"    ]] && [[ -n "$(ls "$BUNDLE/configs/home-bin/"    2>/dev/null)" ]] && echo true || echo false)
 HAS_FLATPAK=$( [[ -d "$BUNDLE/flatpak/var-app"    ]] && echo true || echo false)
 HAS_BROWSERS=$([[ -d "$BUNDLE/browsers"            ]] && echo true || echo false)
 HAS_GNOME=$(   [[ -f "$BUNDLE/gnome/dconf-full.ini" ]] && echo true || echo false)
@@ -2942,24 +2588,19 @@ whiptail --title "🪣  Distro Plopper — Import" \
   --msgbox "\
 Bundle found and loaded.
 
-  Source OS:      $SOURCE_OS
-  Source host:    $SOURCE_HOST
-  Source desktop: $SRC_DE  (this session: ${TARGET_DE})
-  Bundle path:    $BUNDLE
+  Source OS:    $SOURCE_OS
+  Source host:  $SOURCE_HOST
+  Bundle path:  $BUNDLE
 
 Contents:
   • $APP_SUMMARY  ($AUR_COUNT foreign/AUR)
   • $FLATPAK_COUNT Flatpak apps
-  • $SNAP_COUNT Snap packages
-  • $NIX_COUNT Nix packages (best effort)
   • $APPIMAGE_COUNT AppImages (manual copy required)
-  • $MANUAL_BIN_COUNT manual /opt installs (reference only)
   • Configs, dotfiles, ~/.local/share
-  • Browsers, Desktop settings, SSH, Fonts, Steam
+  • Browsers, GNOME, SSH, Fonts, Steam
   • TurboPrint: $TP_IN_BUNDLE
   • NFS mounts: $NFS_IN_BUNDLE
   • AutoFS: $AUTOFS_IN_BUNDLE
-$DE_MISMATCH_NOTE
 
 Press OK to review the pre-flight checklist." \
   $BOX_H $BOX_W || true
@@ -3005,27 +2646,6 @@ if [[ "$FLATPAK_COUNT" -gt 0 ]]; then
     fi
 fi
 
-if [[ "$SNAP_COUNT" -gt 0 ]]; then
-    if command -v snap &>/dev/null; then
-        PREFLIGHT_MSG+="✓  Snap is installed\n"
-    else
-        PREFLIGHT_MSG+="□  ⚠ Install snapd first:\n"
-        case "$PKG_FAMILY" in
-            arch)   PREFLIGHT_MSG+="      sudo pacman -S --needed snapd && sudo systemctl enable --now snapd.socket\n" ;;
-            fedora) PREFLIGHT_MSG+="      sudo dnf install snapd && sudo systemctl enable --now snapd.socket\n" ;;
-            debian) PREFLIGHT_MSG+="      sudo apt install snapd\n" ;;
-        esac
-    fi
-fi
-
-if [[ "$NIX_COUNT" -gt 0 ]]; then
-    if command -v nix-env &>/dev/null; then
-        PREFLIGHT_MSG+="✓  Nix is installed\n"
-    else
-        PREFLIGHT_MSG+="□  ⚠ Nix not found — install it first from https://nixos.org/download (reinstall is best-effort)\n"
-    fi
-fi
-
 if [[ "$TP_IN_BUNDLE" == "yes" ]]; then
     PREFLIGHT_MSG+="\n─────────────────────────────────────────────\n"
     PREFLIGHT_MSG+="TURBOPRINT (important — install BEFORE import):\n"
@@ -3034,10 +2654,10 @@ if [[ "$TP_IN_BUNDLE" == "yes" ]]; then
     PREFLIGHT_MSG+="□  Install it: sudo ./setup  (TGZ) or  sudo dpkg -i *.deb\n"
     PREFLIGHT_MSG+="□  Have your .tpkey license file accessible\n"
     PREFLIGHT_MSG+="□  Your printer is connected and powered on\n"
-    if [[ -d "$BUNDLE/turboprint/license" ]] && [[ -n "$(ls -A "$BUNDLE/turboprint/license" 2>/dev/null)" ]]; then
+    if [[ -f "$BUNDLE/turboprint/config/"*.tpkey ]] 2>/dev/null; then
         PREFLIGHT_MSG+="✓  License key found in bundle\n"
     else
-        PREFLIGHT_MSG+="□  ⚠ No .tpkey found in bundle — the config/turboprint.ctf may still work if this is the same hardware; otherwise locate your key file\n"
+        PREFLIGHT_MSG+="□  ⚠ No .tpkey found in bundle — locate your key file\n"
     fi
 fi
 
@@ -3204,39 +2824,6 @@ Space = toggle  |  Tab = move to OK/Cancel  |  Enter = confirm  |  Esc = cancel"
     fi
 fi
 
-# ── Snap checklist ────────────────────────────────────────────────────────────
-declare -a SELECTED_SNAP=()
-declare -A SNAP_CLASSIC=()
-if [[ "$IMP_NO_PACKAGES" == false ]] && [[ -f "$BUNDLE/packages/snap-full.txt" ]] && [[ "$SNAP_COUNT" -gt 0 ]]; then
-    if ! command -v snap &>/dev/null; then
-        whiptail --title "Snap — Not Installed" \
-          --msgbox "Snap is not installed on this system. Skipping $SNAP_COUNT Snap packages.
-Install snapd first, then re-run the import." \
-          12 $BOX_W
-    else
-        CHECKLIST_ARGS=()
-        while IFS=$'\t' read -r name version notes; do
-            LABEL="$name (${version:-?})"
-            [[ "$notes" == *classic* ]] && LABEL="$LABEL [classic]" && SNAP_CLASSIC["$name"]=1
-            CHECKLIST_ARGS+=("$name" "$LABEL" "ON")
-        done < "$BUNDLE/packages/snap-full.txt"
-
-        SNAP_CHOICES=$(whiptail --title "Stage 1 of 2: Snap Packages ($SNAP_COUNT found)" \
-          --checklist \
-"Select Snap packages to install.
-All are pre-selected. Uncheck any you don't want.
-Space = toggle  |  Tab = move to OK/Cancel  |  Enter = confirm  |  Esc = cancel" \
-          $BOX_H $BOX_W $(( BOX_H - 10 )) \
-          "${CHECKLIST_ARGS[@]}" \
-          3>&1 1>&2 2>&3) || true
-
-        if [[ -n "$SNAP_CHOICES" ]]; then
-            read -ra SELECTED_SNAP <<< "$SNAP_CHOICES"
-            SELECTED_SNAP=("${SELECTED_SNAP[@]//\"/}")
-        fi
-    fi
-fi
-
 # ── AppImages notice ──────────────────────────────────────────────────────────
 if [[ "$APPIMAGE_COUNT" -gt 0 ]]; then
     whiptail --title "AppImages ($APPIMAGE_COUNT found)" \
@@ -3284,66 +2871,11 @@ See the import summary for the exact copy commands." \
     fi
 fi
 
-# ── Nix packages (best effort) ────────────────────────────────────────────────
-INSTALL_NIX=false
-if [[ "$IMP_NO_PACKAGES" == false ]] && [[ -f "$BUNDLE/packages/nix-packages.txt" ]] && [[ "$NIX_COUNT" -gt 0 ]]; then
-    if ! command -v nix-env &>/dev/null; then
-        whiptail --title "Nix — Not Installed" \
-          --msgbox "Nix is not installed on this system. Skipping $NIX_COUNT Nix packages.
-Install Nix first (https://nixos.org/download), then re-run the import." \
-          12 $BOX_W
-        add_manual "Nix packages were NOT reinstalled (Nix not found) — see packages/nix-packages.txt"
-    else
-        whiptail --title "Nix Packages ($NIX_COUNT found)" \
-          --yesno "Reinstall $NIX_COUNT Nix packages via 'nix-env -iA nixpkgs.<name>'?
-
-This is BEST EFFORT: package names captured from the old system's
-nix-env profile don't always match nixpkgs attribute names exactly.
-Anything that fails will be listed at the end for manual install.
-
-Proceed?" \
-          15 $BOX_W && INSTALL_NIX=true || true
-    fi
-fi
-
-# ── Manual /opt installs — reference only ─────────────────────────────────────
-if [[ "$MANUAL_BIN_COUNT" -gt 0 ]]; then
-    whiptail --title "Manual /opt Installs ($MANUAL_BIN_COUNT found)" \
-      --msgbox "\
-These were installed outside any package manager and cannot be
-reinstalled automatically. Copy them manually from the old system:
-
-$(cat "$BUNDLE/packages/manual-bins.txt")" \
-      $BOX_H $BOX_W
-    while read -r _mb; do
-        add_manual "Manually installed under /opt on old system — copy over yourself: $_mb"
-    done < "$BUNDLE/packages/manual-bins.txt"
-fi
-
-# ── Language tool packages (pip/pipx/npm/cargo/gem) — reference only ─────────
-if [[ "$LANG_TOOLS_COUNT" -gt 0 ]]; then
-    whiptail --title "Language Tool Packages ($LANG_TOOLS_COUNT found)" \
-      --msgbox "\
-pip, pipx, npm, cargo and gem packages can't be blindly reinstalled
-(versions/interpreters differ per system). They were saved for reference:
-
-  packages/pip-user.txt        packages/cargo-installed.txt
-  packages/pipx.txt            packages/gem-list.txt
-  packages/npm-global.txt
-
-Reinstall what you need with each tool's own installer
-(pipx install, npm install -g, cargo install, gem install)." \
-      $BOX_H $BOX_W
-    add_manual "Reinstall language-tool packages manually — see packages/pip-user.txt, pipx.txt, npm-global.txt, cargo-installed.txt, gem-list.txt"
-fi
-
 # ── Confirm package install ───────────────────────────────────────────────────
 SUMMARY_LINES=""
 [[ "$INSTALL_NATIVE" == true ]] && SUMMARY_LINES+="  • $APP_SUMMARY\n"
 [[ "${#SELECTED_AUR[@]}" -gt 0 && "$PKG_FAMILY" == "arch" ]] && SUMMARY_LINES+="  • ${#SELECTED_AUR[@]} AUR packages\n"
 [[ "${#SELECTED_FLATPAK[@]}" -gt 0 ]] && SUMMARY_LINES+="  • ${#SELECTED_FLATPAK[@]} Flatpak apps\n"
-[[ "${#SELECTED_SNAP[@]}" -gt 0 ]] && SUMMARY_LINES+="  • ${#SELECTED_SNAP[@]} Snap packages\n"
-[[ "$INSTALL_NIX" == true ]] && SUMMARY_LINES+="  • $NIX_COUNT Nix packages (best effort)\n"
 [[ -z "$SUMMARY_LINES" ]] && SUMMARY_LINES="  • Nothing selected\n"
 
 whiptail --title "Confirm Package Installation" \
@@ -3365,13 +2897,13 @@ if [[ "$DO_INSTALL" == true ]]; then
             arch)
                 # Capture packages pacman can't find (AUR), try AUR helper for those
                 _PACMAN_FAILED=$(mktemp)
-                sudo pacman -S --needed --noconfirm - < "$PKG_INSTALL_FILE" 2>&1 \
+                sudo pacman -S --needed - < "$PKG_INSTALL_FILE" 2>&1 \
                     | tee -a "$IMPORT_LOG" \
                     | grep "^error: target not found:" \
                     | sed 's/error: target not found: //' > "$_PACMAN_FAILED" || true
                 if [[ -s "$_PACMAN_FAILED" ]] && [[ -n "$AUR_HELPER" ]]; then
                     warn "$(wc -l < "$_PACMAN_FAILED") packages not in official repos — trying $AUR_HELPER..."
-                    $AUR_HELPER -S --needed --noconfirm - < "$_PACMAN_FAILED" 2>&1 | tee -a "$IMPORT_LOG" || warn "Some AUR packages failed"
+                    $AUR_HELPER -S --needed - < "$_PACMAN_FAILED" 2>&1 | tee -a "$IMPORT_LOG" || warn "Some AUR packages failed"
                 elif [[ -s "$_PACMAN_FAILED" ]]; then
                     warn "$(wc -l < "$_PACMAN_FAILED") packages not found — install an AUR helper (yay/paru) and retry"
                     cat "$_PACMAN_FAILED"
@@ -3389,7 +2921,7 @@ if [[ "$DO_INSTALL" == true ]]; then
     if [[ "${#SELECTED_AUR[@]}" -gt 0 ]] && [[ "$PKG_FAMILY" == "arch" ]]; then
         echo ""
         header "Installing AUR packages (${#SELECTED_AUR[@]})..."
-        printf '%s\n' "${SELECTED_AUR[@]}" | $AUR_HELPER -S --needed --noconfirm - 2>&1 | tee -a "$IMPORT_LOG" || warn "Some AUR packages failed"
+        printf '%s\n' "${SELECTED_AUR[@]}" | $AUR_HELPER -S --needed - 2>&1 | tee -a "$IMPORT_LOG" || warn "Some AUR packages failed"
         ok "AUR packages done"
     fi
 
@@ -3425,42 +2957,26 @@ Add these PPAs now? (requires internet connection)" \
     if [[ "${#SELECTED_FLATPAK[@]}" -gt 0 ]]; then
         echo ""
         header "Installing Flatpak apps (${#SELECTED_FLATPAK[@]})..."
-        install_flatpak_apps SELECTED_FLATPAK
+        # Build app→remote map from bundle's recorded origins
+        declare -A _FP_RMAP=()
+        [[ -f "$BUNDLE/packages/flatpak-full.txt" ]] && while IFS=$'\t' read -r _aid _n _v _ori; do
+            _FP_RMAP["$_aid"]="${_ori:-flathub}"
+        done < "$BUNDLE/packages/flatpak-full.txt"
+        # Group selected apps by their source remote and install each group
+        declare -A _FP_BREM=()
+        for _app in "${SELECTED_FLATPAK[@]}"; do
+            _rem="${_FP_RMAP[$_app]:-flathub}"
+            _FP_BREM["$_rem"]+=" $_app"
+        done
+        _FP_ALL_OK=true
+        for _rem in "${!_FP_BREM[@]}"; do
+            read -ra _apps <<< "${_FP_BREM[$_rem]}"
+            flatpak install --noninteractive --or-update "$_rem" "${_apps[@]}" 2>&1 | tee -a "$IMPORT_LOG" \
+                || { warn "Some Flatpak apps from $_rem failed"; _FP_ALL_OK=false; }
+        done
+        [[ "$_FP_ALL_OK" == true ]] && ok "Flatpak apps done" || warn "Some Flatpak apps may not have installed — check log above"
         info "  Log out and back in for Flatpak apps to appear in your launcher"
         add_manual "Log out and back in (or reboot) for Flatpak apps to appear in your launcher"
-    fi
-
-    if [[ "${#SELECTED_SNAP[@]}" -gt 0 ]]; then
-        echo ""
-        header "Installing Snap packages (${#SELECTED_SNAP[@]})..."
-        _SNAP_ALL_OK=true
-        for _snap in "${SELECTED_SNAP[@]}"; do
-            if [[ -n "${SNAP_CLASSIC[$_snap]:-}" ]]; then
-                sudo snap install --classic "$_snap" 2>&1 | tee -a "$IMPORT_LOG" || { warn "Snap failed: $_snap"; _SNAP_ALL_OK=false; }
-            else
-                sudo snap install "$_snap" 2>&1 | tee -a "$IMPORT_LOG" || { warn "Snap failed: $_snap"; _SNAP_ALL_OK=false; }
-            fi
-        done
-        [[ "$_SNAP_ALL_OK" == true ]] && ok "Snap packages done" || warn "Some Snap packages failed — check log above"
-    fi
-
-    if [[ "$INSTALL_NIX" == true ]]; then
-        echo ""
-        header "Installing Nix packages ($NIX_COUNT, best effort)..."
-        _NIX_FAILED=$(mktemp)
-        while read -r _pkg _rest; do
-            [[ -z "$_pkg" ]] && continue
-            _name="${_pkg%%-[0-9]*}"
-            nix-env -iA "nixpkgs.$_name" 2>&1 | tee -a "$IMPORT_LOG" || echo "$_pkg" >> "$_NIX_FAILED"
-        done < "$BUNDLE/packages/nix-packages.txt"
-        if [[ -s "$_NIX_FAILED" ]]; then
-            warn "$(wc -l < "$_NIX_FAILED") Nix package(s) failed — attribute name likely didn't match nixpkgs:"
-            cat "$_NIX_FAILED"
-            add_manual "Nix packages that failed to reinstall automatically — install manually: $(paste -sd', ' "$_NIX_FAILED")"
-        else
-            ok "Nix packages done"
-        fi
-        rm -f "$_NIX_FAILED"
     fi
 
     whiptail --title "✅ Packages Complete" \
@@ -3497,7 +3013,7 @@ The bundle will still be here when you come back."               $BOX_H $BOX_W |
   • Printer configs:  $(ls "$BUNDLE/turboprint/config/" 2>/dev/null | wc -l) files
   • CUPS PPD files:   $(ls "$BUNDLE/turboprint/ppd/" 2>/dev/null | wc -l) printer queue(s)
   • ICC profiles:     $(ls "$BUNDLE/turboprint/profiles/" 2>/dev/null | wc -l) profiles
-  • License key:      $( find "$BUNDLE/turboprint/license" -name "*.tpkey" 2>/dev/null | head -1 | xargs -r basename || echo "not found (config/turboprint.ctf may still work if this is the same hardware)" )
+  • License key:      $( find "$BUNDLE/turboprint/config" -name "*.tpkey" 2>/dev/null | head -1 | xargs basename 2>/dev/null || echo "not found" )
   • User settings:    $( [[ -f "$BUNDLE/turboprint/user/dot-turboprint" ]] && echo "yes" || echo "no" )
 
 Restore TurboPrint configuration now?"               $BOX_H $BOX_W && _DO_TP_RESTORE=true || _DO_TP_RESTORE=false
@@ -3516,24 +3032,21 @@ Restore TurboPrint configuration now?"               $BOX_H $BOX_W && _DO_TP_RES
                 log_import "RESTORED: TurboPrint"
                 add_manual "TurboPrint: if printer port is wrong, open xtpsetup → Edit → re-select port"
 
-                TPKEY_FOUND=$(find "$BUNDLE/turboprint/license" -name "*.tpkey" 2>/dev/null | head -1 || true)
+                TPKEY_FOUND=$(find /etc/turboprint -name "*.tpkey" 2>/dev/null | head -1 || true)
                 whiptail --title "TurboPrint — License"                   --msgbox "TurboPrint config restored and CUPS restarted.
 
-The license baked into config/turboprint.ctf carried over and should just
-work if this is the same physical hardware as the original machine.
-
 License key status:
-  $( [[ -n "$TPKEY_FOUND" ]] && echo "✅ Original key backed up: $TPKEY_FOUND" || echo "⚠️  No .tpkey backed up — locate your key file" )
-  If printouts show a watermark (license didn't carry over — e.g. new
-  hardware), re-activate with:
-  $( [[ -n "$TPKEY_FOUND" ]] && echo "  sudo tpsetup --install \"$TPKEY_FOUND\"" || echo "  sudo tpsetup --install <keyfile>.tpkey" )
+  $( [[ -n "$TPKEY_FOUND" ]] && echo "✅ Key found: $(basename "$TPKEY_FOUND")" || echo "⚠️  No .tpkey found — locate and run:" )
+  $( [[ -z "$TPKEY_FOUND" ]] && echo "  sudo tpsetup --install <keyfile>.tpkey" || true )
 
 Verify printer queues:
   xtpsetup        (GUI)
   tpsetup --list  (command line)
 
 ⚠️  If the printer port is wrong (common after migration):
-  Open xtpsetup → Edit → re-select the port from the list."                   $BOX_H $BOX_W || true
+  Open xtpsetup → Edit → re-select the port from the list.
+
+If printouts show a watermark, the license needs re-applying."                   $BOX_H $BOX_W || true
             fi
         fi
     else
@@ -3555,14 +3068,7 @@ Verify printer queues:
             else
                 info "[DRY RUN] would restore TurboPrint"
             fi
-            _TPKEY_FOUND=$(find "$BUNDLE/turboprint/license" -name "*.tpkey" 2>/dev/null | head -1 || true)
-            if [[ -n "$_TPKEY_FOUND" ]]; then
-                info "  License key backed up at: $_TPKEY_FOUND"
-                info "  Config/turboprint.ctf should already work if this is the same hardware — if printouts show a watermark, re-activate with:"
-                info "    sudo tpsetup --install \"$_TPKEY_FOUND\""
-            else
-                warn "No .tpkey backed up — if printouts show a watermark, locate your key file and run: sudo tpsetup --install <keyfile>.tpkey"
-            fi
+            warn "Verify license: sudo tpsetup --install /etc/turboprint/<keyfile>.tpkey"
         else
             warn "TurboPrint not installed — skipping config restore. Install first and re-run."
         fi
@@ -3676,10 +3182,6 @@ fi
 
 if [[ "$RESTORE_CONFIGS" == true ]]; then
     step "~/.config..."; do_copy "$BUNDLE/configs/config-dirs/." "$HOME/.config" --force; ok "~/.config restored"; log_import "RESTORED: ~/.config"
-    if [[ "$SAME_DE" == true ]] && [[ "$SRC_DE" != "GNOME" ]] && [[ "$SRC_DE" != "unknown" ]]; then
-        ok "$SRC_DE desktop settings restored (panel, shortcuts, theme — all under ~/.config)"
-    fi
-    [[ -f "$BUNDLE/configs/keyboard-layout.conf" ]] && { step "Keyboard layout..."; restore_keyboard_layout; }
 fi
 if [[ "$RESTORE_DOTFILES" == true ]]; then
     step "Dotfiles..."; do_copy "$BUNDLE/configs/dotfiles/." "$HOME"; ok "Dotfiles restored"; log_import "RESTORED: dotfiles"
@@ -3688,7 +3190,6 @@ if [[ "$RESTORE_LOCAL" == true ]]; then
     [[ "$HAS_LOCAL" == true ]] && { step "~/.local/share..."; do_copy "$BUNDLE/configs/local-share/." "$HOME/.local/share" --force; ok "~/.local/share restored"; log_import "RESTORED: ~/.local/share"; }
     [[ "$HAS_STATE" == true ]] && { step "~/.local/state..."; do_copy "$BUNDLE/configs/local-state/." "$HOME/.local/state" --force; ok "~/.local/state restored"; log_import "RESTORED: ~/.local/state"; }
     [[ "$HAS_BIN"   == true ]] && { step "~/.local/bin...";   do_copy "$BUNDLE/configs/local-bin/."   "$HOME/.local/bin"   --force; ok "~/.local/bin restored";   log_import "RESTORED: ~/.local/bin"; chmod +x "$HOME/.local/bin/"* 2>/dev/null || true; }
-    [[ "$HAS_HOME_BIN" == true ]] && { step "~/bin...";       do_copy "$BUNDLE/configs/home-bin/."    "$HOME/bin"          --force; ok "~/bin restored";         log_import "RESTORED: ~/bin";        chmod +x "$HOME/bin/"*        2>/dev/null || true; }
     # Shotwell DB needs force-copy — Shotwell auto-creates an empty photo.db on first launch
     # which cp -rn (no-overwrite) would silently skip, leaving an empty library
     if [[ -d "$BUNDLE/configs/local-share/shotwell" ]] && [[ "$DRY_RUN" == false ]]; then
@@ -3735,10 +3236,7 @@ if [[ "$RESTORE_GNOME" == true ]]; then
     fi
     step "dconf settings (GNOME Tweaks, keyboard shortcuts, all settings)..."
     if [[ -f "$BUNDLE/gnome/dconf-full.ini" ]] && command -v dconf &>/dev/null; then
-        if ! de_uses_dconf "$TARGET_DE"; then
-            info "This system's desktop ($TARGET_DE) doesn't use dconf for its own settings — skipping dconf load."
-            [[ "$SRC_DE" != "$TARGET_DE" ]] && info "  ($SRC_DE's shortcuts/theme don't carry over to $TARGET_DE anyway — see the desktop-mismatch note)"
-        elif [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
+        if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
             warn "No active GNOME session detected — dconf settings NOT restored"
             warn "Run this from a terminal inside your GNOME session:"
             warn "  dconf load / < $BUNDLE/gnome/dconf-full.ini"
@@ -4061,10 +3559,7 @@ echo ""
 printf "  %-30s %s\n" "${_DISTRO_LABEL} apps:"          "$APP_SUMMARY"
 [[ "$AUR_COUNT" -gt 0 ]] && printf "  %-30s %s\n" "Foreign/AUR packages:" "$AUR_COUNT  (${SRC_PKG_MANAGER} → ${PKG_MANAGER})"
 printf "  %-30s %s\n" "Flatpak apps:"      "$FLATPAK_COUNT"
-printf "  %-30s %s\n" "Snap packages:"     "$SNAP_COUNT"
-printf "  %-30s %s\n" "Nix packages:"      "$NIX_COUNT (best effort)"
 printf "  %-30s %s\n" "AppImages:"         "$APPIMAGE_COUNT (manual)"
-printf "  %-30s %s\n" "Manual /opt installs:" "$MANUAL_BIN_COUNT (manual)"
 [[ "$DRY_RUN" == true ]] && echo -e "\n  ${YELLOW}DRY RUN — nothing will be written${RESET}"
 echo ""
 echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
@@ -4087,13 +3582,13 @@ if [[ "$IMP_NO_PACKAGES" == false ]]; then
             case "$PKG_FAMILY" in
                 arch)
                     _PACMAN_FAILED=$(mktemp)
-                    sudo pacman -S --needed --noconfirm - < "$PKG_INSTALL_FILE" 2>&1 \
+                    sudo pacman -S --needed - < "$PKG_INSTALL_FILE" 2>&1 \
                         | tee -a "$IMPORT_LOG" \
                         | grep "^error: target not found:" \
                         | sed 's/error: target not found: //' > "$_PACMAN_FAILED" || true
                     if [[ -s "$_PACMAN_FAILED" ]] && [[ -n "$AUR_HELPER" ]]; then
                         warn "$(wc -l < "$_PACMAN_FAILED") packages not in official repos — trying $AUR_HELPER..."
-                        $AUR_HELPER -S --needed --noconfirm - < "$_PACMAN_FAILED" 2>&1 | tee -a "$IMPORT_LOG" || warn "Some AUR packages failed"
+                        $AUR_HELPER -S --needed - < "$_PACMAN_FAILED" 2>&1 | tee -a "$IMPORT_LOG" || warn "Some AUR packages failed"
                     elif [[ -s "$_PACMAN_FAILED" ]]; then
                         warn "$(wc -l < "$_PACMAN_FAILED") packages not found — install an AUR helper (yay/paru) and retry"
                         cat "$_PACMAN_FAILED"
@@ -4136,8 +3631,22 @@ if [[ "$IMP_NO_PACKAGES" == false ]]; then
         step "Flatpak apps ($FLATPAK_COUNT)..."
         if command -v flatpak &>/dev/null; then
             if [[ "$DRY_RUN" == false ]]; then
-                mapfile -t _ALL_FLATPAK_APPS < "$BUNDLE/packages/flatpak-apps.txt"
-                install_flatpak_apps _ALL_FLATPAK_APPS
+                # Build app→remote map then install each remote's apps as a group
+                declare -A _FP_RMAP=()
+                [[ -f "$BUNDLE/packages/flatpak-full.txt" ]] && while IFS=$'\t' read -r _aid _n _v _ori; do
+                    _FP_RMAP["$_aid"]="${_ori:-flathub}"
+                done < "$BUNDLE/packages/flatpak-full.txt"
+                declare -A _FP_BREM=()
+                while read -r _app; do
+                    [[ -z "$_app" ]] && continue
+                    _rem="${_FP_RMAP[$_app]:-flathub}"
+                    _FP_BREM["$_rem"]+=" $_app"
+                done < "$BUNDLE/packages/flatpak-apps.txt"
+                for _rem in "${!_FP_BREM[@]}"; do
+                    read -ra _apps <<< "${_FP_BREM[$_rem]}"
+                    flatpak install --noninteractive --or-update "$_rem" "${_apps[@]}" 2>&1 | tee -a "$IMPORT_LOG" \
+                        || warn "Some Flatpak apps from $_rem failed"
+                done
                 info "  Log out and back in for Flatpak apps to appear in your launcher"
                 add_manual "Log out and back in (or reboot) for Flatpak apps to appear in your launcher"
             else
@@ -4148,74 +3657,12 @@ if [[ "$IMP_NO_PACKAGES" == false ]]; then
         fi
     fi
 
-    if [[ -f "$BUNDLE/packages/snap-full.txt" ]] && [[ "$SNAP_COUNT" -gt 0 ]]; then
-        step "Snap packages ($SNAP_COUNT)..."
-        if command -v snap &>/dev/null; then
-            if [[ "$DRY_RUN" == false ]]; then
-                _SNAP_ALL_OK=true
-                while IFS=$'\t' read -r _name _ver _notes; do
-                    [[ -z "$_name" ]] && continue
-                    if [[ "$_notes" == *classic* ]]; then
-                        sudo snap install --classic "$_name" 2>&1 | tee -a "$IMPORT_LOG" || { warn "Snap failed: $_name"; _SNAP_ALL_OK=false; }
-                    else
-                        sudo snap install "$_name" 2>&1 | tee -a "$IMPORT_LOG" || { warn "Snap failed: $_name"; _SNAP_ALL_OK=false; }
-                    fi
-                done < "$BUNDLE/packages/snap-full.txt"
-                [[ "$_SNAP_ALL_OK" == true ]] && ok "Snap packages done" || warn "Some Snap packages failed — check log above"
-            else
-                info "[DRY RUN] snap install $SNAP_COUNT packages"
-            fi
-        else
-            warn "Snap not installed — skipping ($SNAP_COUNT packages)"
-        fi
-    fi
-
-    if [[ -f "$BUNDLE/packages/nix-packages.txt" ]] && [[ "$NIX_COUNT" -gt 0 ]]; then
-        step "Nix packages ($NIX_COUNT, best effort)..."
-        if command -v nix-env &>/dev/null; then
-            if [[ "$DRY_RUN" == false ]]; then
-                _NIX_FAILED=$(mktemp)
-                while read -r _pkg _rest; do
-                    [[ -z "$_pkg" ]] && continue
-                    _name="${_pkg%%-[0-9]*}"
-                    nix-env -iA "nixpkgs.$_name" 2>&1 | tee -a "$IMPORT_LOG" || echo "$_pkg" >> "$_NIX_FAILED"
-                done < "$BUNDLE/packages/nix-packages.txt"
-                if [[ -s "$_NIX_FAILED" ]]; then
-                    warn "$(wc -l < "$_NIX_FAILED") Nix package(s) failed — attribute name likely didn't match nixpkgs:"
-                    cat "$_NIX_FAILED"
-                    add_manual "Nix packages that failed to reinstall automatically — install manually: $(paste -sd', ' "$_NIX_FAILED")"
-                else
-                    ok "Nix packages done"
-                fi
-                rm -f "$_NIX_FAILED"
-            else
-                info "[DRY RUN] nix-env -iA nixpkgs.<name> for $NIX_COUNT packages"
-            fi
-        else
-            warn "Nix not installed — skipping ($NIX_COUNT packages)"
-            add_manual "Nix packages were NOT reinstalled (Nix not found) — see packages/nix-packages.txt"
-        fi
-    fi
-
     if [[ "$APPIMAGE_COUNT" -gt 0 ]]; then
         warn "AppImages ($APPIMAGE_COUNT) require manual install:"
         cat "$BUNDLE/packages/appimages.txt"
         while read -r _ai; do
             add_manual "Install AppImage manually: $_ai  →  chmod +x and move to ~/Applications/"
         done < "$BUNDLE/packages/appimages.txt"
-    fi
-
-    if [[ "$MANUAL_BIN_COUNT" -gt 0 ]]; then
-        warn "Manual /opt installs ($MANUAL_BIN_COUNT) require manual copy:"
-        cat "$BUNDLE/packages/manual-bins.txt"
-        while read -r _mb; do
-            add_manual "Manually installed under /opt on old system — copy over yourself: $_mb"
-        done < "$BUNDLE/packages/manual-bins.txt"
-    fi
-
-    if [[ "$LANG_TOOLS_COUNT" -gt 0 ]]; then
-        info "Language tool packages (pip/pipx/npm/cargo/gem) saved for reference — not auto-reinstalled"
-        add_manual "Reinstall language-tool packages manually — see packages/pip-user.txt, pipx.txt, npm-global.txt, cargo-installed.txt, gem-list.txt"
     fi
 fi
 
@@ -4239,16 +3686,11 @@ fi
 header "PHASE 3: Restoring configs..."
 
 [[ "$IMP_NO_CONFIGS" == false && "$HAS_CONFIGS"  == true ]] && { step "~/.config...";      do_copy "$BUNDLE/configs/config-dirs/." "$HOME/.config" --force; ok "done"; log_import "RESTORED: ~/.config"; }
-if [[ "$IMP_NO_CONFIGS" == false && "$HAS_CONFIGS" == true && "$SAME_DE" == true && "$SRC_DE" != "GNOME" && "$SRC_DE" != "unknown" ]]; then
-    ok "$SRC_DE desktop settings restored (panel, shortcuts, theme — all under ~/.config)"
-fi
-[[ "$IMP_NO_CONFIGS" == false && -f "$BUNDLE/configs/keyboard-layout.conf" ]] && { step "Keyboard layout..."; restore_keyboard_layout; }
 [[ "$IMP_NO_CONFIGS" == false && "$HAS_DOTFILES" == true ]] && { step "Dotfiles...";       do_copy "$BUNDLE/configs/dotfiles/."    "$HOME";              ok "done"; log_import "RESTORED: dotfiles"; }
 if [[ "$IMP_NO_CONFIGS" == false ]] && [[ "$HAS_LOCAL" == true || "$HAS_STATE" == true || "$HAS_BIN" == true ]]; then
     [[ "$HAS_LOCAL" == true ]] && { step "~/.local/share..."; do_copy "$BUNDLE/configs/local-share/." "$HOME/.local/share" --force; ok "done"; log_import "RESTORED: ~/.local/share"; }
     [[ "$HAS_STATE" == true ]] && { step "~/.local/state..."; do_copy "$BUNDLE/configs/local-state/." "$HOME/.local/state" --force; ok "done"; log_import "RESTORED: ~/.local/state"; }
     [[ "$HAS_BIN"   == true ]] && { step "~/.local/bin...";   do_copy "$BUNDLE/configs/local-bin/."   "$HOME/.local/bin"   --force; ok "done"; log_import "RESTORED: ~/.local/bin"; chmod +x "$HOME/.local/bin/"* 2>/dev/null || true; }
-    [[ "$HAS_HOME_BIN" == true ]] && { step "~/bin...";       do_copy "$BUNDLE/configs/home-bin/."    "$HOME/bin"          --force; ok "done"; log_import "RESTORED: ~/bin"; chmod +x "$HOME/bin/"* 2>/dev/null || true; }
     if [[ -d "$BUNDLE/configs/local-share/shotwell" ]] && [[ "$DRY_RUN" == false ]]; then
         mkdir -p "$HOME/.local/share/shotwell"
         cp -rf "$BUNDLE/configs/local-share/shotwell/." "$HOME/.local/share/shotwell/" 2>/dev/null || true
@@ -4287,10 +3729,7 @@ if [[ "$IMP_NO_GNOME" == false && "$HAS_GNOME" == true ]]; then
         fi
     fi
     if [[ -f "$BUNDLE/gnome/dconf-full.ini" ]] && command -v dconf &>/dev/null && [[ "$DRY_RUN" == false ]]; then
-        if ! de_uses_dconf "$TARGET_DE"; then
-            info "This system's desktop ($TARGET_DE) doesn't use dconf for its own settings — skipping dconf load."
-            [[ "$SRC_DE" != "$TARGET_DE" ]] && info "  ($SRC_DE's shortcuts/theme don't carry over to $TARGET_DE anyway — see the desktop-mismatch note)"
-        elif [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
+        if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
             warn "No active GNOME session — dconf NOT restored. Run from a GNOME terminal:"
             warn "  dconf load / < $BUNDLE/gnome/dconf-full.ini"
             log_import "SKIPPED: dconf (no session bus)"

@@ -2746,10 +2746,21 @@ BUNDLE="$BUNDLE_PATH"
 if [[ "$BUNDLE_PATH" == *.tar.gz ]]; then
     [[ ! -f "$BUNDLE_PATH" ]] && { err "Archive not found: $BUNDLE_PATH"; exit 1; }
     info "Extracting archive: $BUNDLE_PATH"
-    EXTRACT_DIR=$(mktemp -d)
+    # Extract next to the archive rather than in /tmp: /tmp is often a small
+    # RAM-backed tmpfs (with per-user quotas) and bundles can be tens of GB.
+    EXTRACT_PARENT="${PLOPPER_EXTRACT_DIR:-$(dirname "$(realpath "$BUNDLE_PATH")")}"
+    ARCHIVE_BYTES=$(du -sb "$BUNDLE_PATH" | awk '{print $1}')
+    AVAIL_BYTES=$(df -B1 --output=avail "$EXTRACT_PARENT" 2>/dev/null | tail -1 | tr -d ' ')
+    if [[ -n "$AVAIL_BYTES" ]] && (( AVAIL_BYTES < ARCHIVE_BYTES * 3 / 2 )); then
+        err "Not enough free space in $EXTRACT_PARENT to extract the bundle."
+        echo "  Archive: $(numfmt --to=iec "$ARCHIVE_BYTES")  Free: $(numfmt --to=iec "$AVAIL_BYTES")"
+        echo "  Set PLOPPER_EXTRACT_DIR to a location with more space, or extract it"
+        echo "  yourself and pass the extracted directory to --bundle."
+        exit 1
+    fi
+    EXTRACT_DIR=$(mktemp -d "$EXTRACT_PARENT/.plopper-extract.XXXXXX")
     trap '_pause_if_fm; rm -rf "$EXTRACT_DIR"' EXIT
     if command -v pv &>/dev/null; then
-        ARCHIVE_BYTES=$(du -sb "$BUNDLE_PATH" | awk '{print $1}')
         pv --size "$ARCHIVE_BYTES" --progress --timer --eta --name "  Extracting" "$BUNDLE_PATH" \
             | tar -xz -C "$EXTRACT_DIR"
     else
@@ -2768,6 +2779,12 @@ if [[ "$BUNDLE_PATH" == *.tar.gz ]]; then
     BUNDLE=$(find "$EXTRACT_DIR" -mindepth 1 -maxdepth 1 -type d | head -1)
     ok "Extracted to: $BUNDLE"
 elif [[ -d "$BUNDLE_PATH" ]]; then
+    # Accept the directory an archive was extracted into, where the real
+    # bundle is a single subdirectory holding the manifest.
+    if [[ ! -f "$BUNDLE/plopper-manifest.txt" ]]; then
+        _inner=$(find "$BUNDLE" -mindepth 2 -maxdepth 2 -name plopper-manifest.txt -printf '%h\n')
+        [[ $(wc -l <<<"$_inner") -eq 1 && -n "$_inner" ]] && BUNDLE="$_inner"
+    fi
     ok "Using bundle directory: $BUNDLE"
 else
     err "Bundle not found: $BUNDLE_PATH"; exit 1
